@@ -15,7 +15,7 @@
 
 ## 映射宿主虚拟路径
 
-`WithPathResolver` 可在调用 Promise 前、仍位于 QuickJS owner thread 时，将宿主虚拟路径映射成 root 相对路径。它适用于需要先捕获调用方身份的宿主；返回值仍会经过 root、路径穿越、符号链接和 Policy 检查。resolver 不应直接执行 I/O，失败会以 `ERR_FS_ACCESS_DENIED` 拒绝操作。
+`WithPathResolver` 可在调用 Promise 前、仍位于 QuickJS owner thread 时，将宿主虚拟路径映射成 root 相对路径。它适用于需要先捕获调用方身份的宿主；返回值仍会经过 root、路径穿越、符号链接和 Policy 检查。避免在 resolver 中执行耗时或阻塞 I/O；失败会以 `ERR_FS_ACCESS_DENIED` 拒绝操作。
 
 ```go
 options := []fs.Option{
