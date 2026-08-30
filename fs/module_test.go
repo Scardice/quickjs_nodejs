@@ -157,6 +157,89 @@ func TestPromisesModuleRejectsTraversalAndSymlinkEscapesBeforePolicy(t *testing.
 	}
 }
 
+func TestUnrestrictedAccessPermitsHostPaths(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "host.txt")
+	options := []Option{
+		WithUnrestrictedAccess(),
+		WithPolicy(func(Request) error { return nil }),
+	}
+
+	got := runFSProgram(t, []module.Definition{PromisesModule(options...)}, fmt.Sprintf(`async () => {
+		const fs = await import("fs/promises");
+		await fs.writeFile(%q, "host");
+		return await fs.readFile(%q, "utf8");
+	}`, target, target))
+	if got != "host" {
+		t.Fatalf("unrestricted fs result = %q", got)
+	}
+}
+
+func TestUnrestrictedAccessRejectsSymlinkWithoutPolicy(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "target.txt")
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	options := []Option{
+		WithUnrestrictedAccess(),
+		WithPolicy(func(Request) error { return nil }),
+	}
+
+	got := runFSProgram(t, []module.Definition{PromisesModule(options...)}, fmt.Sprintf(`async () => {
+		const fs = await import("fs/promises");
+		try {
+			await fs.readFile(%q, "utf8");
+			return "allowed";
+		} catch (error) {
+			return error.code;
+		}
+	}`, link))
+	if got != ErrCodeAccessDenied {
+		t.Fatalf("unrestricted symlink result = %q, want %q", got, ErrCodeAccessDenied)
+	}
+}
+
+func TestUnrestrictedAccessDelegatesSymlinksToPolicy(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "target.txt")
+	if err := os.WriteFile(target, []byte("secret"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Skipf("symlink unavailable: %v", err)
+	}
+	var mu sync.Mutex
+	var requests []Request
+	options := []Option{
+		WithUnrestrictedAccess(),
+		WithPolicy(func(Request) error { return nil }),
+		WithSymlinkPolicy(func(request Request) error {
+			mu.Lock()
+			defer mu.Unlock()
+			requests = append(requests, request)
+			return nil
+		}),
+	}
+
+	got := runFSProgram(t, []module.Definition{PromisesModule(options...)}, fmt.Sprintf(`async () => {
+		const fs = await import("fs/promises");
+		return await fs.readFile(%q, "utf8");
+	}`, link))
+	if got != "secret" {
+		t.Fatalf("unrestricted symlink read = %q", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []Request{{Operation: OperationReadFile, Path: filepath.ToSlash(link)}}
+	if len(requests) != len(want) || requests[0] != want[0] {
+		t.Fatalf("symlink policy requests = %#v, want %#v", requests, want)
+	}
+}
+
 func TestFSModuleControlsSyncSurfaceAndExportsPromises(t *testing.T) {
 	root := t.TempDir()
 	if err := os.WriteFile(filepath.Join(root, "rules.txt"), []byte("sync value"), 0o600); err != nil {

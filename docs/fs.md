@@ -2,16 +2,16 @@
 
 [首页](../README.md) › [模块接入教程](module-setup.md) › [模块参考](module-reference.md) › 受控文件访问
 
-使用 `fs.WithRoot` 限定文件树，再用 `fs.WithPolicy` 按操作和 root 相对路径授权。没有有效 root 或非 nil Policy 时，`fs` 默认拒绝所有操作；它不会读取宿主的当前目录，也不会安装 `globalThis.fs`。
+默认使用 `fs.WithRoot` 限定文件树，再用 `fs.WithPolicy` 按操作和 root 相对路径授权。没有有效 root 或非 nil Policy 时，`fs` 默认拒绝所有操作；它不会读取宿主的当前目录，也不会安装 `globalThis.fs`。仅受信任的宿主可以显式选择 `WithUnrestrictedAccess`。
 
 本页面面向把 JavaScript 当作不完全可信扩展代码的 Go 宿主。它说明如何注册 `fs`、写细粒度 Policy、选择异步或同步 API，以及处理拒绝和 I/O 错误。
 
 ## 前置条件
 
-- 创建并管理一个专用 root 目录。只给 JavaScript 需要的文件放入其中。
+- 默认模式需要专用 root 目录。只给 JavaScript 需要的文件放入其中。
 - 不要让不可信并发进程改名 root、替换其父目录，或在 root 中植入符号链接。路径检查不能消除同一台机器上检查与使用之间的竞争。
 - Policy 会在 Promise 操作的 worker goroutine 调用。它必须可并发调用，且不能直接访问 QuickJS context 或 value。
-- 文件路径始终相对 root。绝对路径、卷路径、逃逸 `..` 路径，以及会解析到 root 外的符号链接都会在 Policy 前以 `ERR_FS_ACCESS_DENIED` 拒绝。
+- 默认模式的文件路径始终相对 root。绝对路径、卷路径、逃逸 `..` 路径，以及会解析到 root 外的符号链接都会在 Policy 前以 `ERR_FS_ACCESS_DENIED` 拒绝。
 
 ## 映射宿主虚拟路径
 
@@ -26,6 +26,24 @@ options := []fs.Option{
 ```
 
 Promise 的 `Policy` 依然在 worker goroutine 运行，因此不要把依赖 QuickJS runtime 或瞬时调用上下文的逻辑放进 Policy；在 resolver 中先将该上下文编码到返回的相对路径。
+
+## 受信任宿主的非沙箱访问
+
+`WithUnrestrictedAccess` 移除 root jail，适合已通过其他机制信任全部脚本的宿主。它不能与 `WithRoot` 同时使用，且仍要求 `WithPolicy`；相对路径由 Go 解析为当前工作目录的绝对路径。
+
+非沙箱模式遇到符号链接时，默认拒绝。配置 `WithSymlinkPolicy` 后，回调只接收实际遇到符号链接的操作，并可按 `Request.Operation`、`Request.Path` 与 `Request.Destination` 单独授权：
+
+```go
+options := []fs.Option{
+	fs.WithUnrestrictedAccess(),
+	fs.WithPolicy(authorizeTrustedScript),
+	fs.WithSymlinkPolicy(func(request fs.Request) error {
+		return authorizeTrustedScript(request)
+	}),
+}
+```
+
+不要把全允许的符号链接策略用于不可信脚本。默认 root 模式不会让该策略绕过 root 外符号链接拒绝。
 
 ## 注册只读加写入白名单
 
@@ -228,7 +246,7 @@ typeof fs.readFileSync; // "undefined"
 
 | 情况 | JavaScript 结果 |
 | --- | --- |
-| 缺少有效 root 或 Policy、绝对路径、路径穿越、root 外符号链接、Policy 返回错误 | rejected Promise 或抛出的同步 Error，`error.code === "ERR_FS_ACCESS_DENIED"`。 |
+| 缺少有效 root 或 Policy、默认模式的绝对路径/路径穿越/root 外符号链接、非沙箱模式遇到未授权符号链接、Policy 返回错误 | rejected Promise 或抛出的同步 Error，`error.code === "ERR_FS_ACCESS_DENIED"`。 |
 | 宿主文件系统返回错误 | rejected Promise 或抛出的同步 Error，`error.code === "ERR_FS_IO"`。 |
 
 使用标准 Promise 错误处理；不要从错误消息解析授权结果：

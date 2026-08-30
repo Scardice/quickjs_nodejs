@@ -51,16 +51,22 @@ type Request struct {
 // be safe for concurrent calls.
 type Policy func(Request) error
 
+// SymlinkPolicy decides whether an operation that encounters a symbolic link
+// may proceed. It runs after Policy and receives the same normalized request.
+type SymlinkPolicy func(Request) error
+
 // PathResolver converts a host virtual path to a root-relative path. It runs
 // on the QuickJS calling thread before a Promise operation starts.
 type PathResolver func(path string) (string, error)
 
 // Config controls one fs module instance.
 type Config struct {
-	Root         string
-	Policy       Policy
-	PathResolver PathResolver
-	Sync         bool
+	Root               string
+	Policy             Policy
+	PathResolver       PathResolver
+	SymlinkPolicy      SymlinkPolicy
+	UnrestrictedAccess bool
+	Sync               bool
 }
 
 // Option configures one fs module instance.
@@ -82,6 +88,18 @@ func WithPolicy(policy Policy) Option {
 // returned path remains subject to root-jail validation and Policy.
 func WithPathResolver(resolver PathResolver) Option {
 	return func(config *Config) { config.PathResolver = resolver }
+}
+
+// WithSymlinkPolicy installs authorization for operations that encounter a
+// symbolic link. Unrestricted access denies those operations when unset.
+func WithSymlinkPolicy(policy SymlinkPolicy) Option {
+	return func(config *Config) { config.SymlinkPolicy = policy }
+}
+
+// WithUnrestrictedAccess removes the root jail. It is intended only for
+// trusted host configurations and remains subject to Policy.
+func WithUnrestrictedAccess() Option {
+	return func(config *Config) { config.UnrestrictedAccess = true }
 }
 
 // WithSync controls whether fs exposes its synchronous methods. Promise APIs
@@ -107,6 +125,12 @@ type access struct {
 }
 
 func newAccess(config Config) access {
+	if config.UnrestrictedAccess {
+		if config.Root != "" {
+			return access{config: config, err: denied("unrestricted fs cannot have a root")}
+		}
+		return access{config: config}
+	}
 	if config.Root == "" {
 		return access{config: config, err: denied("fs root is required")}
 	}
@@ -139,15 +163,25 @@ func (a access) preparePath(path string) (string, error) {
 		}
 		path = resolved
 	}
+	if a.config.UnrestrictedAccess {
+		if path == "" {
+			return "", denied("path is required")
+		}
+		absolute, err := filepath.Abs(path)
+		if err != nil {
+			return "", denied("resolve unrestricted path: %v", err)
+		}
+		return filepath.Clean(absolute), nil
+	}
 	return normalizePath(path)
 }
 
 func (a access) readFile(path string, encoding string, sync bool) (fileContents, error) {
-	target, virtual, err := a.resolveExisting(path)
+	target, virtual, symlink, err := a.resolveExisting(path)
 	if err != nil {
 		return fileContents{}, err
 	}
-	if err := a.authorize(OperationReadFile, virtual, "", sync); err != nil {
+	if err := a.authorize(OperationReadFile, virtual, "", sync, symlink); err != nil {
 		return fileContents{}, err
 	}
 	contents, err := os.ReadFile(target)
@@ -158,33 +192,33 @@ func (a access) readFile(path string, encoding string, sync bool) (fileContents,
 }
 
 func (a access) writeFile(path string, data []byte, sync bool) error {
-	target, virtual, err := a.resolveWriteTarget(path)
+	target, virtual, symlink, err := a.resolveWriteTarget(path)
 	if err != nil {
 		return err
 	}
-	if err := a.authorize(OperationWriteFile, virtual, "", sync); err != nil {
+	if err := a.authorize(OperationWriteFile, virtual, "", sync, symlink); err != nil {
 		return err
 	}
 	return os.WriteFile(target, data, 0o600)
 }
 
 func (a access) mkdir(path string, sync bool) error {
-	target, virtual, err := a.resolveWriteTarget(path)
+	target, virtual, symlink, err := a.resolveWriteTarget(path)
 	if err != nil {
 		return err
 	}
-	if err := a.authorize(OperationMkdir, virtual, "", sync); err != nil {
+	if err := a.authorize(OperationMkdir, virtual, "", sync, symlink); err != nil {
 		return err
 	}
 	return os.Mkdir(target, 0o700)
 }
 
 func (a access) readDir(path string, sync bool) ([]string, error) {
-	target, virtual, err := a.resolveExisting(path)
+	target, virtual, symlink, err := a.resolveExisting(path)
 	if err != nil {
 		return nil, err
 	}
-	if err := a.authorize(OperationReadDir, virtual, "", sync); err != nil {
+	if err := a.authorize(OperationReadDir, virtual, "", sync, symlink); err != nil {
 		return nil, err
 	}
 	entries, err := os.ReadDir(target)
@@ -202,12 +236,18 @@ func (a access) stat(path string, follow bool, sync bool) (fs.FileInfo, error) {
 	var (
 		target  string
 		virtual string
+		symlink bool
 		err     error
 	)
 	if follow {
-		target, virtual, err = a.resolveExisting(path)
+		target, virtual, symlink, err = a.resolveExisting(path)
 	} else {
-		target, virtual, err = a.resolveLeaf(path)
+		target, virtual, symlink, err = a.resolveLeaf(path)
+		if err == nil {
+			var leafSymlink bool
+			leafSymlink, err = isSymlink(target)
+			symlink = symlink || leafSymlink
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -216,7 +256,7 @@ func (a access) stat(path string, follow bool, sync bool) (fs.FileInfo, error) {
 	if !follow {
 		operation = OperationLstat
 	}
-	if err := a.authorize(operation, virtual, "", sync); err != nil {
+	if err := a.authorize(operation, virtual, "", sync, symlink); err != nil {
 		return nil, err
 	}
 	if follow {
@@ -226,11 +266,15 @@ func (a access) stat(path string, follow bool, sync bool) (fs.FileInfo, error) {
 }
 
 func (a access) unlink(path string, sync bool) error {
-	target, virtual, err := a.resolveLeaf(path)
+	target, virtual, symlink, err := a.resolveLeaf(path)
 	if err != nil {
 		return err
 	}
-	if err := a.authorize(OperationUnlink, virtual, "", sync); err != nil {
+	leafSymlink, err := isSymlink(target)
+	if err != nil {
+		return err
+	}
+	if err := a.authorize(OperationUnlink, virtual, "", sync, symlink || leafSymlink); err != nil {
 		return err
 	}
 	info, err := os.Lstat(target)
@@ -244,82 +288,133 @@ func (a access) unlink(path string, sync bool) error {
 }
 
 func (a access) rename(source, destination string, sync bool) error {
-	sourceTarget, sourceVirtual, err := a.resolveLeaf(source)
+	sourceTarget, sourceVirtual, sourceSymlink, err := a.resolveLeaf(source)
 	if err != nil {
 		return err
 	}
-	if _, err := os.Lstat(sourceTarget); err != nil {
-		return err
-	}
-	destinationTarget, destinationVirtual, err := a.resolveWriteTarget(destination)
+	sourceInfo, err := os.Lstat(sourceTarget)
 	if err != nil {
 		return err
 	}
-	if err := a.authorize(OperationRename, sourceVirtual, destinationVirtual, sync); err != nil {
+	destinationTarget, destinationVirtual, destinationSymlink, err := a.resolveWriteTarget(destination)
+	if err != nil {
+		return err
+	}
+	if err := a.authorize(
+		OperationRename,
+		sourceVirtual,
+		destinationVirtual,
+		sync,
+		sourceSymlink || sourceInfo.Mode()&os.ModeSymlink != 0 || destinationSymlink,
+	); err != nil {
 		return err
 	}
 	return os.Rename(sourceTarget, destinationTarget)
 }
 
-func (a access) resolveExisting(path string) (string, string, error) {
-	target, virtual, err := a.resolveLeaf(path)
+func (a access) resolveExisting(path string) (string, string, bool, error) {
+	target, virtual, symlink, err := a.resolveLeaf(path)
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 	resolved, err := filepath.EvalSymlinks(target)
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
-	if !isWithin(a.root, resolved) {
-		return "", "", denied("path %q resolves outside fs root", virtual)
+	if !a.config.UnrestrictedAccess && !isWithin(a.root, resolved) {
+		return "", "", false, denied("path %q resolves outside fs root", virtual)
 	}
-	return resolved, virtual, nil
+	return resolved, virtual, symlink || !samePath(target, resolved), nil
 }
 
-func (a access) resolveWriteTarget(path string) (string, string, error) {
-	target, virtual, err := a.resolveLeaf(path)
+func (a access) resolveWriteTarget(path string) (string, string, bool, error) {
+	target, virtual, symlink, err := a.resolveLeaf(path)
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
-	if info, err := os.Lstat(target); err == nil && info.Mode()&os.ModeSymlink != 0 {
-		return "", "", denied("path %q is a symlink", virtual)
-	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return "", "", err
+	leafSymlink, err := isSymlink(target)
+	if err != nil {
+		return "", "", false, err
 	}
-	return target, virtual, nil
+	if leafSymlink && !a.config.UnrestrictedAccess {
+		return "", "", false, denied("path %q is a symlink", virtual)
+	}
+	return target, virtual, symlink || leafSymlink, nil
 }
 
-func (a access) resolveLeaf(path string) (string, string, error) {
+func (a access) resolveLeaf(path string) (string, string, bool, error) {
 	if a.err != nil {
-		return "", "", a.err
+		return "", "", false, a.err
 	}
+	if a.config.UnrestrictedAccess {
+		target, err := filepath.Abs(path)
+		if err != nil {
+			return "", "", false, err
+		}
+		originalParent := filepath.Dir(target)
+		parent, err := filepath.EvalSymlinks(originalParent)
+		if err != nil {
+			return "", "", false, err
+		}
+		return filepath.Join(parent, filepath.Base(target)), filepath.ToSlash(target), !samePath(originalParent, parent), nil
+	}
+
 	virtual, err := normalizePath(path)
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
-	parent, err := filepath.EvalSymlinks(filepath.Join(a.root, filepath.FromSlash(filepath.Dir(virtual))))
+	originalParent := filepath.Join(a.root, filepath.FromSlash(filepath.Dir(virtual)))
+	parent, err := filepath.EvalSymlinks(originalParent)
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
 	if !isWithin(a.root, parent) {
-		return "", "", denied("path %q resolves outside fs root", virtual)
+		return "", "", false, denied("path %q resolves outside fs root", virtual)
 	}
-	return filepath.Join(parent, filepath.Base(virtual)), virtual, nil
+	return filepath.Join(parent, filepath.Base(virtual)), virtual, !samePath(originalParent, parent), nil
 }
 
-func (a access) authorize(operation Operation, path, destination string, sync bool) error {
-	if a.config.Policy == nil {
-		return denied("fs policy is required")
-	}
-	if err := a.config.Policy(Request{
+func (a access) authorize(operation Operation, path, destination string, sync bool, symlink bool) error {
+	request := Request{
 		Operation:   operation,
 		Path:        path,
 		Destination: destination,
 		Sync:        sync,
-	}); err != nil {
+	}
+	if a.config.Policy == nil {
+		return denied("fs policy is required")
+	}
+	if err := a.config.Policy(request); err != nil {
 		return denied("fs policy rejected %s %q: %v", operation, path, err)
 	}
+	if !symlink {
+		return nil
+	}
+	if a.config.SymlinkPolicy == nil {
+		if a.config.UnrestrictedAccess {
+			return denied("fs symlink policy is required")
+		}
+		return nil
+	}
+	if err := a.config.SymlinkPolicy(request); err != nil {
+		return denied("fs symlink policy rejected %s %q: %v", operation, path, err)
+	}
 	return nil
+}
+
+func isSymlink(path string) (bool, error) {
+	info, err := os.Lstat(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return info.Mode()&os.ModeSymlink != 0, nil
+}
+
+func samePath(left, right string) bool {
+	return filepath.Clean(left) == filepath.Clean(right)
 }
 
 func normalizePath(path string) (string, error) {
