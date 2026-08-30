@@ -741,7 +741,7 @@ func valueString(value *quickjs.Value) string {
 }
 
 func parseURL(input string, base *neturl.URL, requireAbsolute bool) (*neturl.URL, error) {
-	input = strings.TrimSpace(input)
+	input = strings.TrimSpace(stripURLTabsAndNewlines(input))
 	parsed, err := neturl.Parse(input)
 	if err != nil {
 		return nil, err
@@ -760,6 +760,25 @@ func parseURL(input string, base *neturl.URL, requireAbsolute bool) (*neturl.URL
 		return nil, fmt.Errorf("URL has no hostname")
 	}
 	return parsed, nil
+}
+
+func stripURLTabsAndNewlines(input string) string {
+	start := strings.IndexAny(input, "\t\n\r")
+	if start == -1 {
+		return input
+	}
+	var output strings.Builder
+	output.Grow(len(input) - 1)
+	output.WriteString(input[:start])
+	for index := start; index < len(input); index++ {
+		switch input[index] {
+		case '\t', '\n', '\r':
+			continue
+		default:
+			output.WriteByte(input[index])
+		}
+	}
+	return output.String()
 }
 
 func normalizeURL(u *neturl.URL) {
