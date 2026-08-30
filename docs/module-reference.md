@@ -86,7 +86,7 @@ loop, err := eventloop.New(
 | --- | --- | --- | --- |
 | 日志 | `console.ModuleWithPrinter(printer)`、`console.InstallGlobalWithPrinter(ctx, printer)` | 默认 printer 写到标准输出或标准错误。 | `console.Printer` 的 `Log`、`Warn`、`Error` 方法。宿主可将日志写入请求日志、审计流或丢弃。 |
 | HTTP | `fetch.WithTransport(http.RoundTripper)`、`fetch.WithPolicy(func(*http.Request) error)` | 没有 transport 时，每个 `fetch` 返回 rejected promise。 | Policy 在发请求前接收完整 `*http.Request`；按 URL、方法、header 或 body 元数据拒绝。transport 决定实际连接、代理、TLS 和超时。 |
-| 文件系统 | `fs.WithRoot(string)`、`fs.WithPolicy(func(fs.Request) error)`、`fs.WithSync(bool)` | 没有有效 root 或非 nil Policy 时，所有操作都以 `ERR_FS_ACCESS_DENIED` 拒绝。 | Policy 接收操作、规范化 root 相对路径、rename 目标和同步标志。完整规则与可运行示例见[受控文件访问](fs.md)。 |
+| 文件系统 | `fs.WithRoot(string)`、`fs.WithPolicy(func(fs.Request) error)`、`fs.WithSymlinkPolicy(func(fs.Request) error)`、`fs.WithUnrestrictedAccess()`、`fs.WithSync(bool)` | 默认没有有效 root 或非 nil Policy 时，所有操作都以 `ERR_FS_ACCESS_DENIED` 拒绝。非沙箱模式与 root 互斥，且遇到符号链接时要求 SymlinkPolicy。 | Policy 接收操作、规范化路径、rename 目标和同步标志；SymlinkPolicy 只接收遇到符号链接的操作。完整规则与可运行示例见[受控文件访问](fs.md)。 |
 | 环境变量 | `process.WithEnvSnapshot(map[string]string)`、`process.WithEnvProvider(func() map[string]string)` | `process.env` 默认为空。 | 快照只公开指定键值；provider 可以为每个 context 返回不同副本。不要把 `os.Environ()` 原样交给不可信脚本。 |
 | WebSocket | `websocket.WithDialer(dialer)`、`websocket.WithHeaders(headers)`、`websocket.WithPolicy(func(*url.URL) error)` | 没有 dialer 时，连接失败。 | Policy 在拨号前接收解析后的 URL；headers 为每个连接复制。dialer 决定真实网络路径。 |
 | CommonJS 源码 | `require.WithSourceLoader(loader)`、`require.WithPathResolver(resolver)`、`require.WithBaseDir(base)`、`require.WithGlobalFolders(folders...)` | path-backed `require` 默认禁用。 | loader 决定可读文件；resolver 决定 specifier 如何映射；base 和全局目录决定搜索范围。 |

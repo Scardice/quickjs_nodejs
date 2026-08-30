@@ -37,8 +37,8 @@ const (
 	OperationRename    Operation = "rename"
 )
 
-// Request describes a root-relative filesystem operation. Path and Destination
-// are normalized with slash separators and never contain an escaping .. segment.
+// Request describes a normalized filesystem operation. In root mode Path and
+// Destination are root-relative; in unrestricted mode they are host-absolute.
 type Request struct {
 	Operation   Operation
 	Path        string

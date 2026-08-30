@@ -126,7 +126,7 @@ func main() {
 | `websocket` | `WithDialer(Dialer)`、`WithHeaders(http.Header)`、`WithPolicy(Policy)` | 未注入 dialer 时不能建立连接；policy 在拨号前执行。 |
 | `process` | `WithEnvProvider(EnvProvider)`、`WithEnvSnapshot(map[string]string)` | 只将提供的环境变量写入 `process.env`。 |
 | `console` | `ModuleWithPrinter(Printer)`、`InstallGlobalWithPrinter` | 将 JavaScript 日志交给宿主的 `Log`、`Warn`、`Error`。 |
-| `fs` | `Module(...)`、`PromisesModule(...)`、`WithRoot(string)`、`WithPolicy(Policy)`、`WithSync(bool)` | 无 root 或 Policy 时全部拒绝；只接受 root 内相对路径，并拒绝路径穿越及会跟随到 root 外的符号链接。root 目录不得由不可信并发进程改名或植入符号链接；Promise Policy 在 worker goroutine 调用。 |
+| `fs` | `Module(...)`、`PromisesModule(...)`、`WithRoot(string)`、`WithPolicy(Policy)`、`WithSymlinkPolicy(SymlinkPolicy)`、`WithUnrestrictedAccess()`、`WithSync(bool)` | 默认无 root 或 Policy 时全部拒绝；只接受 root 内相对路径，并拒绝路径穿越及会跟随到 root 外的符号链接。`WithUnrestrictedAccess` 与 root 互斥，仍要求 Policy，并要求 SymlinkPolicy 显式授权遇到的符号链接。Promise Policy 在 worker goroutine 调用。 |
 
 **依赖与类型：** `messagechannel` 会安装所需的 `structuredClone`；`structuredclone` 和 `fetch` 会安装所需的 `Blob` globals。各模块声明位于对应包的 `types/*.d.ts`，现有全局声明汇总在 `global-types/globals.d.ts`。
 
