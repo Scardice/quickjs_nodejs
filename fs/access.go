@@ -51,11 +51,16 @@ type Request struct {
 // be safe for concurrent calls.
 type Policy func(Request) error
 
+// PathResolver converts a host virtual path to a root-relative path. It runs
+// on the QuickJS calling thread before a Promise operation starts.
+type PathResolver func(path string) (string, error)
+
 // Config controls one fs module instance.
 type Config struct {
-	Root   string
-	Policy Policy
-	Sync   bool
+	Root         string
+	Policy       Policy
+	PathResolver PathResolver
+	Sync         bool
 }
 
 // Option configures one fs module instance.
@@ -71,6 +76,12 @@ func WithRoot(root string) Option {
 // operations.
 func WithPolicy(policy Policy) Option {
 	return func(config *Config) { config.Policy = policy }
+}
+
+// WithPathResolver installs an optional host virtual-path resolver. The
+// returned path remains subject to root-jail validation and Policy.
+func WithPathResolver(resolver PathResolver) Option {
+	return func(config *Config) { config.PathResolver = resolver }
 }
 
 // WithSync controls whether fs exposes its synchronous methods. Promise APIs
@@ -115,6 +126,20 @@ func newAccess(config Config) access {
 		return access{config: config, err: denied("fs root is not a directory")}
 	}
 	return access{config: config, root: filepath.Clean(root)}
+}
+
+func (a access) preparePath(path string) (string, error) {
+	if a.err != nil {
+		return "", a.err
+	}
+	if a.config.PathResolver != nil {
+		resolved, err := a.config.PathResolver(path)
+		if err != nil {
+			return "", denied("resolve fs path %q: %v", path, err)
+		}
+		path = resolved
+	}
+	return normalizePath(path)
 }
 
 func (a access) readFile(path string, encoding string, sync bool) (fileContents, error) {

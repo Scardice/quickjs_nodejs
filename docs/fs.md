@@ -13,6 +13,20 @@
 - Policy 会在 Promise 操作的 worker goroutine 调用。它必须可并发调用，且不能直接访问 QuickJS context 或 value。
 - 文件路径始终相对 root。绝对路径、卷路径、逃逸 `..` 路径，以及会解析到 root 外的符号链接都会在 Policy 前以 `ERR_FS_ACCESS_DENIED` 拒绝。
 
+## 映射宿主虚拟路径
+
+`WithPathResolver` 可在调用 Promise 前、仍位于 QuickJS owner thread 时，将宿主虚拟路径映射成 root 相对路径。它适用于需要先捕获调用方身份的宿主；返回值仍会经过 root、路径穿越、符号链接和 Policy 检查。resolver 不应直接执行 I/O，失败会以 `ERR_FS_ACCESS_DENIED` 拒绝操作。
+
+```go
+options := []fs.Option{
+	fs.WithRoot(extensionRoot),
+	fs.WithPathResolver(resolveExtensionDataURI),
+	fs.WithPolicy(authorizeExtensionData),
+}
+```
+
+Promise 的 `Policy` 依然在 worker goroutine 运行，因此不要把依赖 QuickJS runtime 或瞬时调用上下文的逻辑放进 Policy；在 resolver 中先将该上下文编码到返回的相对路径。
+
 ## 注册只读加写入白名单
 
 下面的完整程序只允许读取 `rules.txt`，以及写入 `state/roll.txt`。它注册 `node:fs` 和 `node:fs/promises`，从 JavaScript 写入文件，再由 Go 输出保存结果。

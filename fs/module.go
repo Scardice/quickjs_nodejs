@@ -183,7 +183,7 @@ func (builder *apiBuilder) cachedAPI(ctx *quickjs.Context, key string, create fu
 }
 
 func (builder *apiBuilder) readFile(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
-	path, err := requiredPath(args, 0)
+	path, err := builder.requiredPath(args, 0)
 	if err != nil {
 		return rejectedPromise(ctx, err)
 	}
@@ -197,7 +197,7 @@ func (builder *apiBuilder) readFile(ctx *quickjs.Context, _ *quickjs.Value, args
 }
 
 func (builder *apiBuilder) writeFile(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
-	path, err := requiredPath(args, 0)
+	path, err := builder.requiredPath(args, 0)
 	if err != nil {
 		return rejectedPromise(ctx, err)
 	}
@@ -211,7 +211,7 @@ func (builder *apiBuilder) writeFile(ctx *quickjs.Context, _ *quickjs.Value, arg
 }
 
 func (builder *apiBuilder) mkdir(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
-	path, err := requiredPath(args, 0)
+	path, err := builder.requiredPath(args, 0)
 	if err != nil {
 		return rejectedPromise(ctx, err)
 	}
@@ -221,7 +221,7 @@ func (builder *apiBuilder) mkdir(ctx *quickjs.Context, _ *quickjs.Value, args []
 }
 
 func (builder *apiBuilder) readdir(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
-	path, err := requiredPath(args, 0)
+	path, err := builder.requiredPath(args, 0)
 	if err != nil {
 		return rejectedPromise(ctx, err)
 	}
@@ -239,7 +239,7 @@ func (builder *apiBuilder) lstat(ctx *quickjs.Context, _ *quickjs.Value, args []
 }
 
 func (builder *apiBuilder) fileInfo(ctx *quickjs.Context, args []*quickjs.Value, follow, sync bool) *quickjs.Value {
-	path, err := requiredPath(args, 0)
+	path, err := builder.requiredPath(args, 0)
 	if err != nil {
 		if sync {
 			return throwFSError(ctx, err)
@@ -263,7 +263,7 @@ func (builder *apiBuilder) fileInfo(ctx *quickjs.Context, args []*quickjs.Value,
 }
 
 func (builder *apiBuilder) unlink(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
-	path, err := requiredPath(args, 0)
+	path, err := builder.requiredPath(args, 0)
 	if err != nil {
 		return rejectedPromise(ctx, err)
 	}
@@ -273,11 +273,11 @@ func (builder *apiBuilder) unlink(ctx *quickjs.Context, _ *quickjs.Value, args [
 }
 
 func (builder *apiBuilder) rename(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
-	source, err := requiredPath(args, 0)
+	source, err := builder.requiredPath(args, 0)
 	if err != nil {
 		return rejectedPromise(ctx, err)
 	}
-	destination, err := requiredPath(args, 1)
+	destination, err := builder.requiredPath(args, 1)
 	if err != nil {
 		return rejectedPromise(ctx, err)
 	}
@@ -287,7 +287,7 @@ func (builder *apiBuilder) rename(ctx *quickjs.Context, _ *quickjs.Value, args [
 }
 
 func (builder *apiBuilder) readFileSync(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
-	path, err := requiredPath(args, 0)
+	path, err := builder.requiredPath(args, 0)
 	if err != nil {
 		return throwFSError(ctx, err)
 	}
@@ -307,7 +307,7 @@ func (builder *apiBuilder) readFileSync(ctx *quickjs.Context, _ *quickjs.Value, 
 }
 
 func (builder *apiBuilder) writeFileSync(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
-	path, err := requiredPath(args, 0)
+	path, err := builder.requiredPath(args, 0)
 	if err != nil {
 		return throwFSError(ctx, err)
 	}
@@ -322,7 +322,7 @@ func (builder *apiBuilder) writeFileSync(ctx *quickjs.Context, _ *quickjs.Value,
 }
 
 func (builder *apiBuilder) mkdirSync(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
-	path, err := requiredPath(args, 0)
+	path, err := builder.requiredPath(args, 0)
 	if err != nil {
 		return throwFSError(ctx, err)
 	}
@@ -333,7 +333,7 @@ func (builder *apiBuilder) mkdirSync(ctx *quickjs.Context, _ *quickjs.Value, arg
 }
 
 func (builder *apiBuilder) readdirSync(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
-	path, err := requiredPath(args, 0)
+	path, err := builder.requiredPath(args, 0)
 	if err != nil {
 		return throwFSError(ctx, err)
 	}
@@ -357,7 +357,7 @@ func (builder *apiBuilder) lstatSync(ctx *quickjs.Context, _ *quickjs.Value, arg
 }
 
 func (builder *apiBuilder) unlinkSync(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
-	path, err := requiredPath(args, 0)
+	path, err := builder.requiredPath(args, 0)
 	if err != nil {
 		return throwFSError(ctx, err)
 	}
@@ -368,11 +368,11 @@ func (builder *apiBuilder) unlinkSync(ctx *quickjs.Context, _ *quickjs.Value, ar
 }
 
 func (builder *apiBuilder) renameSync(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
-	source, err := requiredPath(args, 0)
+	source, err := builder.requiredPath(args, 0)
 	if err != nil {
 		return throwFSError(ctx, err)
 	}
-	destination, err := requiredPath(args, 1)
+	destination, err := builder.requiredPath(args, 1)
 	if err != nil {
 		return throwFSError(ctx, err)
 	}
@@ -380,6 +380,14 @@ func (builder *apiBuilder) renameSync(ctx *quickjs.Context, _ *quickjs.Value, ar
 		return throwFSError(ctx, err)
 	}
 	return ctx.NewUndefined()
+}
+
+func (builder *apiBuilder) requiredPath(args []*quickjs.Value, index int) (string, error) {
+	path, err := requiredPath(args, index)
+	if err != nil {
+		return "", err
+	}
+	return builder.access.preparePath(path)
 }
 
 func requiredPath(args []*quickjs.Value, index int) (string, error) {

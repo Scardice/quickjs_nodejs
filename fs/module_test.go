@@ -64,6 +64,55 @@ func TestPromisesModuleReadsAndWritesAfterPolicyApproval(t *testing.T) {
 	}
 }
 
+func TestPromisesModuleResolvesPathsBeforePolicy(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "sandbox"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	var mu sync.Mutex
+	var requests []Request
+	options := []Option{
+		WithRoot(root),
+		WithPathResolver(func(path string) (string, error) {
+			if path != "data://note.txt" {
+				return "", fmt.Errorf("unsupported virtual path %q", path)
+			}
+			return "sandbox/note.txt", nil
+		}),
+		WithPolicy(func(request Request) error {
+			mu.Lock()
+			defer mu.Unlock()
+			requests = append(requests, request)
+			return nil
+		}),
+	}
+
+	got := runFSProgram(t, []module.Definition{PromisesModule(options...)}, `async () => {
+		const fs = await import("node:fs/promises");
+		await fs.writeFile("data://note.txt", "isolated");
+		return await fs.readFile("data://note.txt", "utf8");
+	}`)
+	if got != "isolated" {
+		t.Fatalf("resolved fs result = %q", got)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	want := []Request{
+		{Operation: OperationWriteFile, Path: "sandbox/note.txt"},
+		{Operation: OperationReadFile, Path: "sandbox/note.txt"},
+	}
+	if len(requests) != len(want) {
+		t.Fatalf("policy requests = %#v, want %#v", requests, want)
+	}
+	for index := range want {
+		if requests[index] != want[index] {
+			t.Fatalf("policy request %d = %#v, want %#v", index, requests[index], want[index])
+		}
+	}
+}
+
 func TestPromisesModuleRejectsTraversalAndSymlinkEscapesBeforePolicy(t *testing.T) {
 	root := t.TempDir()
 	outside := t.TempDir()
