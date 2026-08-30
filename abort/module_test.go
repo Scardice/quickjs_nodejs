@@ -92,6 +92,42 @@ func TestAbortSignalTimeoutAbortsOnEventLoopTimer(t *testing.T) {
 	}
 }
 
+func TestAbortEventHasStandardFields(t *testing.T) {
+	loop, err := eventloop.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loop.Close()
+
+	var result string
+	if err := loop.Run(func(ctx *quickjs.Context) error {
+		if err := InstallGlobal(ctx); err != nil {
+			return err
+		}
+		value := ctx.Eval(`(() => {
+			const controller = new AbortController();
+			let event;
+			controller.signal.addEventListener("abort", value => { event = value; });
+			controller.abort();
+			return [event.type, event.bubbles, event.cancelable, event.composed, event.isTrusted, event.target === controller.signal].join("|");
+		})()`)
+		if value == nil {
+			return &testError{"abort event evaluation returned nil"}
+		}
+		defer value.Free()
+		if value.IsException() {
+			return ctx.Exception()
+		}
+		result = value.ToString()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := result, "abort|false|false|false|true|true"; got != want {
+		t.Fatalf("abort event = %q, want %q", got, want)
+	}
+}
+
 type testError struct{ message string }
 
 func (e *testError) Error() string { return e.message }

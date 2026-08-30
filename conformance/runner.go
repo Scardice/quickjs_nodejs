@@ -7,7 +7,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 
+	"github.com/Scardice/quickjs_nodejs/eventloop"
 	quickjs "github.com/buke/quickjs-go"
 )
 
@@ -18,7 +20,7 @@ type wptURLVector struct {
 }
 
 func suiteRoot(name string) (string, error) {
-	if name != "wpt" && name != "test262" {
+	if name != "wpt" && name != "test262" && name != "wycheproof" {
 		return "", fmt.Errorf("unsupported conformance suite %q", name)
 	}
 
@@ -105,4 +107,127 @@ func runTest262Script(root, testPath string) error {
 		value.Free()
 	}
 	return nil
+}
+
+// WPTTestResult is one testharness.js test result.
+type WPTTestResult struct {
+	Name    string `json:"name"`
+	Status  int    `json:"status"`
+	Message string `json:"message"`
+}
+
+// WPTHarnessResult is the completed result reported by testharness.js.
+type WPTHarnessResult struct {
+	Tests    []WPTTestResult `json:"tests"`
+	Status   int             `json:"status"`
+	Message  string          `json:"message"`
+	Complete bool            `json:"-"`
+}
+
+func runWPTHarness(root, testPath string, installers ...eventloop.GlobalInstaller) (WPTHarnessResult, error) {
+	loop, err := eventloop.New(
+		eventloop.WithModuleImport(false),
+		eventloop.WithGlobals(installers...),
+	)
+	if err != nil {
+		return WPTHarnessResult{}, err
+	}
+	defer func() {
+		_ = loop.Close()
+	}()
+
+	var encoded string
+	err = loop.Run(func(ctx *quickjs.Context) error {
+		if err := evalWPTHarnessSource(ctx, `globalThis.self = globalThis; globalThis.location = { search: "", protocol: "https:", hostname: "web-platform.test", href: "https://web-platform.test/" }; globalThis.GLOBAL = { isWindow: () => false, isWorker: () => false, isShadowRealm: () => false }`); err != nil {
+			return err
+		}
+		for _, path := range append([]string{filepath.Join(root, "resources", "testharness.js")}, wptScriptPaths(root, testPath)...) {
+			source, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			if err := evalWPTHarnessSource(ctx, string(source)); err != nil {
+				return fmt.Errorf("%s: %w", path, err)
+			}
+		}
+
+		promise := ctx.Eval(`new Promise(resolve => {
+			add_completion_callback((tests, status) => resolve(JSON.stringify({
+				tests: tests.map(test => ({
+					name: test.name,
+					status: test.status,
+					message: String(test.message || "")
+				})),
+				status: status.status,
+				message: String(status.message || "")
+			})));
+		})`)
+		if promise == nil {
+			return errors.New("WPT completion returned nil")
+		}
+		if promise.IsException() {
+			defer promise.Free()
+			return ctx.Exception()
+		}
+		if !promise.IsPromise() {
+			promise.Free()
+			return errors.New("WPT completion did not return a promise")
+		}
+		value := ctx.Await(promise)
+		promise.Free()
+		if value == nil {
+			return errors.New("WPT completion await returned nil")
+		}
+		defer value.Free()
+		if value.IsException() {
+			return ctx.Exception()
+		}
+		encoded = value.ToString()
+		return nil
+	})
+	if err != nil {
+		return WPTHarnessResult{}, err
+	}
+
+	var result WPTHarnessResult
+	if err := json.Unmarshal([]byte(encoded), &result); err != nil {
+		return WPTHarnessResult{}, err
+	}
+	result.Complete = true
+	return result, nil
+}
+
+func evalWPTHarnessSource(ctx *quickjs.Context, source string) error {
+	value := ctx.Eval(source)
+	if value == nil {
+		return errors.New("WPT source returned nil")
+	}
+	defer value.Free()
+	if value.IsException() {
+		return ctx.Exception()
+	}
+	return nil
+}
+
+func wptScriptPaths(root, testPath string) []string {
+	sourcePath := filepath.Join(root, filepath.FromSlash(testPath))
+	source, err := os.ReadFile(sourcePath)
+	if err != nil {
+		return []string{sourcePath}
+	}
+
+	paths := make([]string, 0)
+	for _, line := range strings.Split(string(source), "\n") {
+		const prefix = "// META: script="
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		resource := strings.TrimSpace(strings.TrimPrefix(line, prefix))
+		if strings.HasPrefix(resource, "/") {
+			paths = append(paths, filepath.Join(root, filepath.FromSlash(resource)))
+			continue
+		}
+		paths = append(paths, filepath.Join(filepath.Dir(sourcePath), filepath.FromSlash(resource)))
+	}
+	return append(paths, sourcePath)
 }

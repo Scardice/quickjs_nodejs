@@ -36,8 +36,3 @@ declare module "node:abort" {
   export * from "abort";
   export { default } from "abort";
 }
-
-declare module "@seal/abort" {
-  export * from "abort";
-  export { default } from "abort";
-}

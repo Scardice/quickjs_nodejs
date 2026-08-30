@@ -1,5 +1,5 @@
 declare module "fetch" {
-  export type BodyInit = string | ArrayBuffer | ArrayBufferView | URLSearchParams | FormData;
+  export type BodyInit = string | ArrayBuffer | ArrayBufferView | URLSearchParams | FormData | import("blob").Blob;
   export type HeadersInit = Headers | Record<string, string> | Array<[string, string]>;
 
   export class Headers {
@@ -7,12 +7,13 @@ declare module "fetch" {
     append(name: string, value: string): void;
     set(name: string, value: string): void;
     get(name: string): string | null;
+    getSetCookie(): string[];
     has(name: string): boolean;
     delete(name: string): void;
-    entries(): Array<[string, string]>;
-    keys(): string[];
-    values(): string[];
-    forEach(callback: (value: string, key: string, headers: Headers) => void, thisArg?: unknown): void;
+    entries(): IterableIterator<[string, string]>;
+    keys(): IterableIterator<string>;
+    values(): IterableIterator<string>;
+    [Symbol.iterator](): IterableIterator<[string, string]>;
     toJSON(): Record<string, string>;
   }
 
@@ -54,7 +55,7 @@ declare module "fetch" {
     arrayBuffer(): Promise<ArrayBuffer>;
     text(): Promise<string>;
     json(): Promise<unknown>;
-    blob(): Promise<ArrayBuffer>;
+    blob(): Promise<import("blob").Blob>;
   }
 
   export class FormData {
@@ -80,11 +81,6 @@ declare module "fetch" {
 }
 
 declare module "node:fetch" {
-  export * from "fetch";
-  export { default } from "fetch";
-}
-
-declare module "@seal/http" {
   export * from "fetch";
   export { default } from "fetch";
 }

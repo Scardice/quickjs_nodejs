@@ -30,7 +30,7 @@ const (
 func Module() module.Definition {
 	return module.Definition{
 		Name:    ModuleName,
-		Aliases: []string{"node:" + ModuleName, "@seal/crypto"},
+		Aliases: []string{"node:" + ModuleName},
 		Exports: []module.Export{
 			{Name: "CryptoKey", Spec: quickjs.FactorySpec{Factory: func(ctx *quickjs.Context) (*quickjs.Value, error) {
 				return cryptoExport(ctx, "CryptoKey")
@@ -147,14 +147,49 @@ func ensureCrypto(ctx *quickjs.Context) (*quickjs.Value, error) {
 
 const cryptoImplementation = `(function () {
   const native = globalThis["__quickjs_nodejs_crypto_native"];
-  if (typeof globalThis.DOMException !== "function") {
+  {
+    const legacyCodes = {
+      IndexSizeError: 1,
+      HierarchyRequestError: 3,
+      WrongDocumentError: 4,
+      InvalidCharacterError: 5,
+      NoModificationAllowedError: 7,
+      NotFoundError: 8,
+      NotSupportedError: 9,
+      InvalidStateError: 11,
+      SyntaxError: 12,
+      InvalidModificationError: 13,
+      NamespaceError: 14,
+      InvalidAccessError: 15,
+      TypeMismatchError: 17,
+      SecurityError: 18,
+      NetworkError: 19,
+      AbortError: 20,
+      URLMismatchError: 21,
+      QuotaExceededError: 22,
+      TimeoutError: 23,
+      InvalidNodeTypeError: 24,
+      DataCloneError: 25
+    };
     globalThis.DOMException = class DOMException extends Error {
       constructor(message = "", name = "Error") {
         super(message);
         this.name = name;
+        this.code = legacyCodes[name] || 0;
+        if (name === "QuotaExceededError") {
+          this.requested = null;
+          this.quota = null;
+        }
       }
     };
   }
+  globalThis.QuotaExceededError = class QuotaExceededError extends globalThis.DOMException {
+    constructor(message = "") {
+      super(message, "QuotaExceededError");
+      this.requested = null;
+      this.quota = null;
+    }
+  };
   if (typeof globalThis.TextEncoder !== "function") {
     globalThis.TextEncoder = class TextEncoder {
       encode(input) {
@@ -262,7 +297,11 @@ func cryptoThrow(ctx *quickjs.Context, err error) *quickjs.Value {
 }
 
 func cryptoDOMException(ctx *quickjs.Context, name, message string) *quickjs.Value {
-	constructor := ctx.Globals().Get("DOMException")
+	constructorName := "DOMException"
+	if name == "QuotaExceededError" {
+		constructorName = "QuotaExceededError"
+	}
+	constructor := ctx.Globals().Get(constructorName)
 	if constructor == nil {
 		return cryptoThrow(ctx, errors.New(message))
 	}
@@ -291,20 +330,28 @@ func cryptoOperationError(ctx *quickjs.Context, message string) *quickjs.Value {
 	return cryptoDOMException(ctx, "OperationError", message)
 }
 
+func cryptoTypeMismatchError(ctx *quickjs.Context, message string) *quickjs.Value {
+	return cryptoDOMException(ctx, "TypeMismatchError", message)
+}
+
+func cryptoQuotaExceededError(ctx *quickjs.Context, message string) *quickjs.Value {
+	return cryptoDOMException(ctx, "QuotaExceededError", message)
+}
+
 func (s *cryptoState) getRandomValues(ctx *quickjs.Context, args []*quickjs.Value) *quickjs.Value {
 	if len(args) < 1 || args[0] == nil {
-		return ctx.ThrowTypeError("crypto.getRandomValues requires an integer typed array")
+		return cryptoTypeMismatchError(ctx, "crypto.getRandomValues requires an integer typed array")
 	}
 	target := args[0]
 	if !(target.IsInt8Array() || target.IsUint8Array() || target.IsUint8ClampedArray() || target.IsInt16Array() || target.IsUint16Array() || target.IsInt32Array() || target.IsUint32Array() || target.IsBigInt64Array() || target.IsBigUint64Array()) {
-		return ctx.ThrowTypeError("crypto.getRandomValues requires an integer typed array")
+		return cryptoTypeMismatchError(ctx, "crypto.getRandomValues requires an integer typed array")
 	}
 	length := propertyInt(target, "byteLength", -1)
 	if length < 0 {
-		return ctx.ThrowTypeError("invalid integer typed array")
+		return cryptoTypeMismatchError(ctx, "invalid integer typed array")
 	}
 	if length > maxGetRandomValuesBytes {
-		return cryptoOperationError(ctx, "crypto.getRandomValues: byteLength exceeds 65536")
+		return cryptoQuotaExceededError(ctx, "crypto.getRandomValues: byteLength exceeds 65536")
 	}
 	data := make([]byte, length)
 	if _, err := cryptorand.Read(data); err != nil {

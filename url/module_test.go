@@ -78,7 +78,7 @@ func TestURLOriginAndHostnameSetter(t *testing.T) {
 			return [unchanged, u.hostname, u.port, u.origin].join("|");
 		`)
 		defer result.Free()
-		if got := result.ToString(); got != "https://example.com:8080/path|xn--mnich-kva.example|8080|https://xn--mnich-kva.example" {
+		if got := result.ToString(); got != "https://example.com:8080/path|xn--mnich-kva.example|8080|https://xn--mnich-kva.example:8080" {
 			t.Fatalf("unexpected URL origin/hostname result %q", got)
 		}
 	})
@@ -104,7 +104,7 @@ func TestURLReferenceNormalization(t *testing.T) {
 			u.port = "5678abcd";
 			same(u.port, "5678");
 			u.port = "a5678abcd";
-			same(u.port, "");
+			same(u.port, "5678");
 			u.protocol = "ftp: blah";
 			same(u.protocol, "ftp:");
 			u.protocol = "foo";
@@ -153,7 +153,7 @@ func TestURLSearchParamsMutationAndIteration(t *testing.T) {
 			return [u.search, u.searchParams.getAll("a").join(","), entries, standalone.toString(), domainToASCII("münich.example"), domainToUnicode("xn--mnich-kva.example"), iteratorTag, deleteUndefined.toString()].join("|");
 		`)
 		defer result.Free()
-		if got := result.ToString(); got != "?a=3&space=hello+world|3|a=3&space=hello world|a=first&z=last|xn--mnich-kva.example|münich.example|[object URLSearchParams Iterator]|a=1&a=2" {
+		if got := result.ToString(); got != "?a=3&space=hello+world|3|a=3&space=hello world|a=first&z=last|xn--mnich-kva.example|münich.example|[object URLSearchParams Iterator]|" {
 			t.Fatalf("unexpected URLSearchParams result %q", got)
 		}
 	})
@@ -208,6 +208,249 @@ func TestURLGlobalInstaller(t *testing.T) {
 		}
 		if got := result.ToString(); got != "example.com:function" {
 			t.Fatalf("unexpected global result %q", got)
+		}
+	})
+}
+
+func TestURLOriginIncludesExplicitPort(t *testing.T) {
+	testutil.WithContext(t, func(ctx *quickjs.Context) {
+		registerURL(t, ctx)
+		result := evalURL(t, ctx, `
+			const u = new m.URL("https://example.test:8443/path");
+			return u.origin;
+		`)
+		defer result.Free()
+		if got, want := result.ToString(), "https://example.test:8443"; got != want {
+			t.Fatalf("URL origin = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestURLStaticsParseAndCanParse(t *testing.T) {
+	testutil.WithContext(t, func(ctx *quickjs.Context) {
+		registerURL(t, ctx)
+		result := evalURL(t, ctx, `
+			const parsed = m.URL.parse("/child", "https://example.test/base");
+			return [m.URL.canParse("/child", "https://example.test/base"), m.URL.canParse("http://"), parsed.href, m.URL.parse("http://") === null].join("|");
+		`)
+		defer result.Free()
+		if got, want := result.ToString(), "true|false|https://example.test/child|true"; got != want {
+			t.Fatalf("URL statics = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestURLBlobOriginUsesNestedURL(t *testing.T) {
+	testutil.WithContext(t, func(ctx *quickjs.Context) {
+		registerURL(t, ctx)
+		result := evalURL(t, ctx, `
+			return [
+				new m.URL("blob:https://example.test:8443/").origin,
+				new m.URL("blob:blob:https://example.test/").origin,
+				new m.URL("blob:ftp://host/path").origin
+			].join("|");
+		`)
+		defer result.Free()
+		if got, want := result.ToString(), "https://example.test:8443|null|null"; got != want {
+			t.Fatalf("Blob URL origins = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestURLSearchParamsKeepsLeadingQueryMark(t *testing.T) {
+	testutil.WithContext(t, func(ctx *quickjs.Context) {
+		registerURL(t, ctx)
+		result := evalURL(t, ctx, `
+			return new m.URL("??a=b&c=d", "http://example.test/base").searchParams.toString();
+		`)
+		defer result.Free()
+		if got, want := result.ToString(), "%3Fa=b&c=d"; got != want {
+			t.Fatalf("URLSearchParams = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestURLNormalizesC0Controls(t *testing.T) {
+	testutil.WithContext(t, func(ctx *quickjs.Context) {
+		registerURL(t, ctx)
+		result := evalURL(t, ctx, `
+			const capture = input => {
+				try {
+					return "ok:" + new m.URL(input).href;
+				} catch (error) {
+					return "error:" + error.name;
+				}
+			};
+			return [
+				capture("\u0000\u001B\u0004\u0012 http://example.com/\u001F \r"),
+				capture("http://example.org/test?a#b\u0000c"),
+				capture("non-special:cannot-be-a-base-url-\u0000\u0001\u001F\u001E~\u007F\u0080"),
+				capture("sc://a\u0000b/")
+			].join("|");
+		`)
+		defer result.Free()
+		if got, want := result.ToString(), "ok:http://example.com/|ok:http://example.org/test?a#b%00c|ok:non-special:cannot-be-a-base-url-%00%01%1F%1E~%7F%C2%80|error:TypeError"; got != want {
+			t.Fatalf("C0 URL normalization = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestURLEncodesTrailingOpaquePathSpacesBeforeQueryOrFragment(t *testing.T) {
+	testutil.WithContext(t, func(ctx *quickjs.Context) {
+		registerURL(t, ctx)
+		result := evalURL(t, ctx, `
+			return [
+				new m.URL("non-special:opaque  ?hi").href,
+				new m.URL("non-special:opaque  #hi").href,
+				new m.URL("non-special:opaque   #hi").href
+			].join("|");
+		`)
+		defer result.Free()
+		if got, want := result.ToString(), "non-special:opaque %20?hi|non-special:opaque %20#hi|non-special:opaque  %20#hi"; got != want {
+			t.Fatalf("opaque trailing spaces = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestURLEncodesCaretsInPaths(t *testing.T) {
+	testutil.WithContext(t, func(ctx *quickjs.Context) {
+		registerURL(t, ctx)
+		result := evalURL(t, ctx, `
+			return [
+				new m.URL("foo://host/path^name").href,
+				new m.URL("wss://host/path^name").href
+			].join("|");
+		`)
+		defer result.Free()
+		if got, want := result.ToString(), "foo://host/path%5Ename|wss://host/path%5Ename"; got != want {
+			t.Fatalf("path caret encoding = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestURLSearchParamsPreservesPlusAndNUL(t *testing.T) {
+	testutil.WithContext(t, func(ctx *quickjs.Context) {
+		registerURL(t, ctx)
+		result := evalURL(t, ctx, `
+			const parsed = new m.URLSearchParams("query=%2B15555555555&a=b\u0000c");
+			const fromObject = new m.URLSearchParams({"+": "%C2"});
+			const serialized = new m.URLSearchParams({a: "b+c"});
+			return [
+				parsed.get("query"),
+				parsed.get("a") === "b\u0000c",
+				parsed.toString(),
+				fromObject.get("+"),
+				serialized.toString()
+			].join("|");
+		`)
+		defer result.Free()
+		if got, want := result.ToString(), "+15555555555|true|query=%2B15555555555&a=b%00c|%C2|a=b%2Bc"; got != want {
+			t.Fatalf("URLSearchParams plus/NUL = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestURLSearchParamsTreatsExplicitUndefinedAsValue(t *testing.T) {
+	testutil.WithContext(t, func(ctx *quickjs.Context) {
+		registerURL(t, ctx)
+		result := evalURL(t, ctx, `
+			const params = new m.URLSearchParams("name=undefined&name=value");
+			params.delete("name", undefined);
+			return [
+				params.toString(),
+				new m.URLSearchParams("name=value").has("name", undefined)
+			].join("|");
+		`)
+		defer result.Free()
+		if got, want := result.ToString(), "|true"; got != want {
+			t.Fatalf("URLSearchParams explicit undefined = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestURLSearchParamsSortsNamesByUTF16CodeUnit(t *testing.T) {
+	testutil.WithContext(t, func(ctx *quickjs.Context) {
+		registerURL(t, ctx)
+		result := evalURL(t, ctx, `
+			const params = new m.URLSearchParams();
+			params.append("😀", "emoji");
+			params.append("ﬃ", "ligature");
+			params.append("a", "ascii");
+			params.sort();
+			return Array.from(params.keys()).join("|");
+		`)
+		defer result.Free()
+		if got, want := result.ToString(), "a|😀|ﬃ"; got != want {
+			t.Fatalf("URLSearchParams UTF-16 sort = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestURLSearchParamsReadsEnumerableRecordProperties(t *testing.T) {
+	testutil.WithContext(t, func(ctx *quickjs.Context) {
+		registerURL(t, ctx)
+		result := evalURL(t, ctx, `
+			const record = Object.create({ inherited: "ignored" });
+			Object.defineProperty(record, "hidden", { value: "ignored", enumerable: false });
+			record.visible = "yes";
+			record["a\u0000b"] = "c\u0000d";
+			record["\uD835x"] = "surrogate";
+			return new m.URLSearchParams(record).toString();
+		`)
+		defer result.Free()
+		if got, want := result.ToString(), "visible=yes&a%00b=c%00d&%EF%BF%BDx=surrogate"; got != want {
+			t.Fatalf("URLSearchParams record conversion = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestURLSearchParamsReplacesUnpairedSurrogates(t *testing.T) {
+	testutil.WithContext(t, func(ctx *quickjs.Context) {
+		registerURL(t, ctx)
+		result := evalURL(t, ctx, `
+			const params = new m.URLSearchParams([["\uD835x", "first"], ["x\uDC53", "second"]]);
+			return Array.from(params.keys()).join("|");
+		`)
+		defer result.Free()
+		if got, want := result.ToString(), "�x|x�"; got != want {
+			t.Fatalf("URLSearchParams unpaired surrogate conversion = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestURLAcceptsLaxIDNAHostsAndNonSpecialControls(t *testing.T) {
+	testutil.WithContext(t, func(ctx *quickjs.Context) {
+		registerURL(t, ctx)
+		result := evalURL(t, ctx, `
+			return [
+				new m.URL("http://a.b.c.XN--pokxncvks").href,
+				new m.URL("file://xn--/p").href,
+				new m.URL("sc://\u0001\u007F/").hostname
+			].join("|");
+		`)
+		defer result.Free()
+		if got, want := result.ToString(), "http://a.b.c.xn--pokxncvks/|file://xn--/p|%01%7F"; got != want {
+			t.Fatalf("URL lax host parsing = %q, want %q", got, want)
+		}
+	})
+}
+
+func TestURLSearchParamsCanonicalizesRecordKeysAndRejectsDOMExceptionPrototype(t *testing.T) {
+	testutil.WithContext(t, func(ctx *quickjs.Context) {
+		registerURL(t, ctx)
+		result := evalURL(t, ctx, `
+			const record = {"\uD835x": "1", xx: "2", "\uD83Dx": "3"};
+			let rejected = false;
+			try {
+				new m.URLSearchParams(DOMException.prototype);
+			} catch (error) {
+				rejected = error instanceof TypeError;
+			}
+			return [new m.URLSearchParams(record).toString(), rejected].join("|");
+		`)
+		defer result.Free()
+		if got, want := result.ToString(), "%EF%BF%BDx=3&xx=2|true"; got != want {
+			t.Fatalf("URLSearchParams record key canonicalization = %q, want %q", got, want)
 		}
 	})
 }

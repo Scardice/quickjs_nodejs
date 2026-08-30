@@ -186,8 +186,3 @@ declare module "node:crypto" {
   export * from "crypto";
   export { default } from "crypto";
 }
-
-declare module "@seal/crypto" {
-  export * from "crypto";
-  export { default } from "crypto";
-}

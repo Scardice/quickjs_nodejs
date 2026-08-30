@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 
+	"github.com/Scardice/quickjs_nodejs/blob"
 	"github.com/Scardice/quickjs_nodejs/buffer"
 	"github.com/Scardice/quickjs_nodejs/eventloop"
 	"github.com/Scardice/quickjs_nodejs/module"
@@ -57,7 +58,7 @@ func Module(options ...Option) module.Definition {
 	builder := newAPIBuilder(applyOptions(options))
 	return module.Definition{
 		Name:    ModuleName,
-		Aliases: []string{"node:fetch", "@seal/http"},
+		Aliases: []string{"node:fetch"},
 		Exports: []module.Export{
 			{Name: "fetch", Spec: quickjs.FactorySpec{Factory: func(ctx *quickjs.Context) (*quickjs.Value, error) {
 				return builder.exportValue(ctx, "fetch")
@@ -125,6 +126,10 @@ func (builder *apiBuilder) exportValue(ctx *quickjs.Context, name string) (*quic
 }
 
 func (builder *apiBuilder) build(ctx *quickjs.Context) (*quickjs.Value, error) {
+	if err := blob.InstallGlobal(ctx); err != nil {
+		return nil, fmt.Errorf("fetch: install Blob globals: %w", err)
+	}
+
 	global := ctx.Globals()
 	cached := global.Get(builder.apiKey)
 	if cached != nil && cached.IsObject() {
@@ -174,6 +179,8 @@ func fetchImplementationFor(nativeKey string) string {
 
 const fetchImplementation = `(function () {
   const native = globalThis.__quickjs_nodejs_fetch_native;
+  const Blob = globalThis.Blob;
+  const blobBytes = globalThis.__quickjs_nodejs_blob_exports.bytes;
   if (typeof globalThis.TextDecoder !== "function") {
     globalThis.TextDecoder = class TextDecoder {
       decode(input) {
@@ -185,23 +192,116 @@ const fetchImplementation = `(function () {
       }
     };
   }
-  class Headers {
-    constructor(init) {
-      this._map = Object.create(null);
-      if (init instanceof Headers) init = init.toJSON();
-      if (Array.isArray(init)) for (const pair of init) this.set(pair[0], pair[1]);
-      else if (init && typeof init === "object") for (const key of Object.keys(init)) this.set(key, init[key]);
+  function toByteString(value, label) {
+    if (typeof value === "symbol") throw new TypeError("Invalid HTTP header " + label);
+    const text = String(value);
+    for (let index = 0; index < text.length; index++) {
+      if (text.charCodeAt(index) > 0xFF) throw new TypeError("Invalid HTTP header " + label);
     }
-    append(name, value) { const key = String(name).toLowerCase(); const old = this._map[key]; this._map[key] = old ? old + ", " + String(value) : String(value); }
-    set(name, value) { this._map[String(name).toLowerCase()] = String(value); }
-    get(name) { const value = this._map[String(name).toLowerCase()]; return value === undefined ? null : value; }
-    has(name) { return Object.prototype.hasOwnProperty.call(this._map, String(name).toLowerCase()); }
-    delete(name) { delete this._map[String(name).toLowerCase()]; }
-    entries() { return Object.entries(this._map); }
-    keys() { return Object.keys(this._map); }
-    values() { return Object.values(this._map); }
-    forEach(callback, thisArg) { for (const pair of this.entries()) callback.call(thisArg, pair[1], pair[0], this); }
-    toJSON() { return Object.assign({}, this._map); }
+    return text;
+  }
+  function normalizeHeaderName(name) {
+    const normalized = toByteString(name, "name");
+    if (!/^[!#$%&'*+\-.^_\x60|~0-9A-Za-z]+$/.test(normalized)) throw new TypeError("Invalid HTTP header name");
+    return normalized.toLowerCase();
+  }
+  function normalizeHeaderValue(value) {
+    const trimmed = toByteString(value, "value").replace(/^[\t\n\r ]+|[\t\n\r ]+$/g, "");
+    if (/[\0\r\n]/.test(trimmed)) throw new TypeError("Invalid HTTP header value");
+    return trimmed;
+  }
+  function makeHeadersIterator(headers, project) {
+    let index = 0;
+    const prototype = Object.create(Object.getPrototypeOf(Object.getPrototypeOf([][Symbol.iterator]())));
+    const iterator = Object.create(prototype);
+    Object.defineProperty(prototype, "next", {
+      configurable: true,
+      enumerable: true,
+      writable: true,
+      value() {
+        const entries = headers._entries();
+        if (index >= entries.length) return {done: true};
+        return {value: project(entries[index++]), done: false};
+      }
+    });
+    return iterator;
+  }
+  class Headers {
+    constructor(init, guard = "none") {
+      this._list = [];
+      this._guard = guard;
+      if (init === undefined) return;
+      if (init === null) throw new TypeError("Headers init must not be null");
+      if (typeof init[Symbol.iterator] === "function") {
+        for (const pair of init) {
+          if (pair === null || typeof pair !== "object" || typeof pair[Symbol.iterator] !== "function") {
+            throw new TypeError("Header pair must be an iterable object");
+          }
+          const values = Array.from(pair);
+          if (values.length !== 2) throw new TypeError("Header pair must contain exactly two entries");
+          this.append(values[0], values[1]);
+        }
+        return;
+      }
+      if (typeof init === "object") {
+        for (const key of Reflect.ownKeys(init)) {
+          const descriptor = Object.getOwnPropertyDescriptor(init, key);
+          if (!descriptor || !descriptor.enumerable) continue;
+          const normalizedName = normalizeHeaderName(key);
+          this.append(normalizedName, init[key]);
+        }
+        return;
+      }
+      throw new TypeError("Headers init must be a record or sequence");
+    }
+    append(name, value) {
+      const normalizedName = normalizeHeaderName(name);
+      if (this._guard === "response" && normalizedName === "set-cookie") return;
+      this._list.push([normalizedName, normalizeHeaderValue(value)]);
+    }
+    set(name, value) {
+      const normalizedName = normalizeHeaderName(name);
+      if (this._guard === "response" && normalizedName === "set-cookie") return;
+      const normalizedValue = normalizeHeaderValue(value);
+      this._list = this._list.filter(entry => entry[0] !== normalizedName);
+      this._list.push([normalizedName, normalizedValue]);
+    }
+    get(name) {
+      const normalizedName = normalizeHeaderName(name);
+      const values = this._list.filter(entry => entry[0] === normalizedName).map(entry => entry[1]);
+      return values.length === 0 ? null : values.join(", ");
+    }
+    getSetCookie() {
+      return this._list.filter(entry => entry[0] === "set-cookie").map(entry => entry[1]);
+    }
+    has(name) {
+      const normalizedName = normalizeHeaderName(name);
+      return this._list.some(entry => entry[0] === normalizedName);
+    }
+    delete(name) {
+      const normalizedName = normalizeHeaderName(name);
+      this._list = this._list.filter(entry => entry[0] !== normalizedName);
+    }
+    _entries() {
+      const names = Array.from(new Set(this._list.map(entry => entry[0]))).sort();
+      const entries = [];
+      for (const name of names) {
+        const values = this._list.filter(entry => entry[0] === name).map(entry => entry[1]);
+        if (name === "set-cookie") {
+          for (const value of values) entries.push([name, value]);
+        } else {
+          entries.push([name, values.join(", ")]);
+        }
+      }
+      return entries;
+    }
+    entries() { return makeHeadersIterator(this, entry => entry); }
+    keys() { return makeHeadersIterator(this, entry => entry[0]); }
+    values() { return makeHeadersIterator(this, entry => entry[1]); }
+    forEach(callback, thisArg) {
+      for (const [name, value] of this.entries()) callback.call(thisArg, value, name, this);
+    }
+    toJSON() { return Object.fromEntries(this.entries()); }
     [Symbol.iterator]() { return this.entries(); }
   }
   class Request {
@@ -232,12 +332,12 @@ const fetchImplementation = `(function () {
       init = init || {};
       this.status = init.status === undefined ? 200 : Number(init.status);
       this.statusText = init.statusText === undefined ? "" : String(init.statusText);
-      this.headers = new Headers(init.headers);
+      this.headers = new Headers(init.headers, "response");
       this.url = init.url === undefined ? "" : String(init.url);
       this.ok = this.status >= 200 && this.status < 300;
       this.redirected = false;
       this.type = "default";
-      this._body = body === undefined || body === null ? new Uint8Array(0) : body;
+      this._body = body === undefined || body === null ? new Uint8Array(0) : body instanceof Blob ? blobBytes(body) : body;
       this.bodyUsed = false;
     }
     clone() {
@@ -247,7 +347,7 @@ const fetchImplementation = `(function () {
     arrayBuffer() { this.bodyUsed = true; return Promise.resolve(this._body instanceof Uint8Array ? this._body.buffer.slice(this._body.byteOffset, this._body.byteOffset + this._body.byteLength) : new TextEncoder().encode(this._body).buffer); }
     text() { this.bodyUsed = true; return Promise.resolve(this._body instanceof Uint8Array ? new TextDecoder().decode(this._body) : String(this._body)); }
     json() { return this.text().then(value => JSON.parse(value)); }
-    blob() { return this.arrayBuffer(); }
+    blob() { this.bodyUsed = true; return Promise.resolve(new Blob([this._body], {type: this.headers.get("content-type") || ""})); }
   }
   class FormData {
     constructor() { this._entries = []; }
@@ -286,11 +386,14 @@ const fetchImplementation = `(function () {
       const encoded = encodeFormData(body);
       body = encoded.body;
       if (!request.headers.has("content-type")) request.headers.set("content-type", encoded.contentType);
+    } else if (body instanceof Blob) {
+      body = blobBytes(body);
+      if (!request.headers.has("content-type") && request.body.type) request.headers.set("content-type", request.body.type);
     } else if (typeof URLSearchParams === "function" && body instanceof URLSearchParams) {
       body = body.toString();
       if (!request.headers.has("content-type")) request.headers.set("content-type", "application/x-www-form-urlencoded;charset=UTF-8");
     }
-    return {url: request.url, method: request.method, headers: request.headers.entries(), body, signal: request.signal};
+    return {url: request.url, method: request.method, headers: Array.from(request.headers), body, signal: request.signal};
   }
   function fetch(input, init) {
     const request = normalizeInput(input, init);

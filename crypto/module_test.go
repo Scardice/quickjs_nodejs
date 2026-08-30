@@ -343,4 +343,52 @@ func TestWebCryptoCustomRSAExponent(t *testing.T) {
 		t.Fatalf("custom RSA verification = %q, want true", result)
 	}
 }
+func TestGetRandomValuesUsesWebIDLErrors(t *testing.T) {
+	loop, err := eventloop.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loop.Close()
+
+	var result string
+	if err := loop.Run(func(ctx *quickjs.Context) error {
+		if err := InstallGlobal(ctx); err != nil {
+			return err
+		}
+		value := ctx.Eval(`(() => {
+			const capture = value => {
+				try {
+					crypto.getRandomValues(value);
+				} catch (error) {
+					return error.name + ":" + error.code + ":" + error.requested + ":" + error.quota;
+				}
+				return "no-error";
+			};
+			const isQuotaExceededError = (() => {
+				try {
+					crypto.getRandomValues(new Uint8Array(65537));
+				} catch (error) {
+					return error.constructor === QuotaExceededError;
+				}
+				return false;
+			})();
+			return [capture(new Float32Array(1)), capture(new DataView(new ArrayBuffer(1))), capture(new Uint8Array(65537)), isQuotaExceededError].join("|");
+		})()`)
+		if value == nil {
+			return &testError{"getRandomValues error evaluation returned nil"}
+		}
+		defer value.Free()
+		if value.IsException() {
+			return ctx.Exception()
+		}
+		result = value.ToString()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := result, "TypeMismatchError:17:undefined:undefined|TypeMismatchError:17:undefined:undefined|QuotaExceededError:22:null:null|true"; got != want {
+		t.Fatalf("getRandomValues errors = %q, want %q", got, want)
+	}
+}
+
 func (e *testError) Error() string { return e.message }

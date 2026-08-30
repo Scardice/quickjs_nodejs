@@ -214,7 +214,7 @@ func extendedExport(ctx *quickjs.Context, name string) (*quickjs.Value, error) {
 func ExtendedModule() module.Definition {
 	return module.Definition{
 		Name:    ModuleName,
-		Aliases: []string{"node:" + ModuleName, "@seal/utilinspect"},
+		Aliases: []string{"node:" + ModuleName},
 		Exports: []module.Export{
 			{Name: "format", Spec: quickjs.FactorySpec{Factory: func(ctx *quickjs.Context) (*quickjs.Value, error) {
 				return extendedExport(ctx, "format")

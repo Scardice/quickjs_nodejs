@@ -2,14 +2,11 @@
 package url
 
 import (
+	"encoding/json"
 	"fmt"
-	"math"
-	"net"
-	neturl "net/url"
-	"path"
 	"sort"
-	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	nodeerrors "github.com/Scardice/quickjs_nodejs/errors"
 	"github.com/Scardice/quickjs_nodejs/module"
@@ -154,16 +151,16 @@ func newURLConstructor(ctx *quickjs.Context, state *urlModuleState) *quickjs.Val
 	implementation := ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
 		input := ""
 		if len(args) > 0 && args[0] != nil {
-			input = args[0].ToString()
+			input = valueString(args[0])
 		}
-		var base *neturl.URL
+		var base *parsedURL
 		if len(args) > 1 && args[1] != nil && !args[1].IsUndefined() {
 			baseHref := ""
 			if baseState := getURLState(args[1]); baseState != nil {
 				baseHref, _ = stateString(baseState, "href")
 				baseState.Free()
 			} else {
-				baseHref = args[1].ToString()
+				baseHref = valueString(args[1])
 			}
 			var err error
 			base, err = parseURL(baseHref, nil, true)
@@ -203,6 +200,30 @@ func newURLConstructor(ctx *quickjs.Context, state *urlModuleState) *quickjs.Val
 		return urlString(ctx, this)
 	})
 	proto.DefinePropertyValue("constructor", ctor, quickjs.PropConfigurable)
+	defineMethod(ctx, ctor, "canParse", func(ctx *quickjs.Context, this *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
+		value := this.CallConstructor(args...)
+		if value == nil {
+			return ctx.NewBool(false)
+		}
+		defer value.Free()
+		if value.IsException() {
+			_ = ctx.Exception()
+			return ctx.NewBool(false)
+		}
+		return ctx.NewBool(true)
+	})
+	defineMethod(ctx, ctor, "parse", func(ctx *quickjs.Context, this *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
+		value := this.CallConstructor(args...)
+		if value == nil {
+			return ctx.NewNull()
+		}
+		if value.IsException() {
+			value.Free()
+			_ = ctx.Exception()
+			return ctx.NewNull()
+		}
+		return value
+	})
 	return ctor
 }
 
@@ -409,10 +430,10 @@ func stateString(state *quickjs.Value, name string) (string, bool) {
 	if value.IsUndefined() {
 		return "", false
 	}
-	return value.ToString(), true
+	return valueString(value), true
 }
 
-func updateURL(ctx *quickjs.Context, object *quickjs.Value, update func(*neturl.URL)) *quickjs.Value {
+func updateURL(ctx *quickjs.Context, object *quickjs.Value, update func(*parsedURL)) *quickjs.Value {
 	state := getURLState(object)
 	if state == nil {
 		return throwURLInvalidThis(ctx, "Value of this must be of type URL")
@@ -427,26 +448,20 @@ func updateURL(ctx *quickjs.Context, object *quickjs.Value, update func(*neturl.
 		return invalidURL(ctx, href, "Invalid URL")
 	}
 	update(u)
-	normalizeURL(u)
 	state.Set("href", ctx.NewString(u.String()))
 	return nil
 }
 
 func urlHash(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value {
-	return urlComponent(ctx, object, func(u *neturl.URL) string {
-		if u.Fragment == "" {
-			return ""
-		}
-		return "#" + u.EscapedFragment()
-	})
+	return urlComponent(ctx, object, func(u *parsedURL) string { return u.hash() })
 }
 
 func urlHost(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value {
-	return urlComponent(ctx, object, func(u *neturl.URL) string { return u.Host })
+	return urlComponent(ctx, object, func(u *parsedURL) string { return u.host() })
 }
 
 func urlHostname(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value {
-	return urlComponent(ctx, object, func(u *neturl.URL) string { return u.Hostname() })
+	return urlComponent(ctx, object, func(u *parsedURL) string { return u.hostname() })
 }
 
 func urlHref(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value {
@@ -454,23 +469,13 @@ func urlHref(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value {
 }
 
 func urlOrigin(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value {
-	return urlComponent(ctx, object, func(u *neturl.URL) string {
-		if u.Scheme == "file" || u.Host == "" {
-			return "null"
-		}
-		return u.Scheme + "://" + u.Hostname()
-	})
+	return urlComponent(ctx, object, func(u *parsedURL) string { return u.origin() })
 }
 
 func urlPassword(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value {
-	return urlComponent(ctx, object, func(u *neturl.URL) string {
-		if u.User == nil {
-			return ""
-		}
-		password, _ := u.User.Password()
-		return password
-	})
+	return urlComponent(ctx, object, func(u *parsedURL) string { return u.password() })
 }
+
 func urlSearchParams(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value {
 	state := getURLState(object)
 	if state == nil {
@@ -488,7 +493,7 @@ func urlSearchParams(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value
 	if !ok {
 		return throwURLInvalidThis(ctx, "Value of this must be of type URL")
 	}
-	parsed, err := neturl.Parse(href)
+	parsed, err := parseURL(href, nil, false)
 	if err != nil {
 		return invalidURL(ctx, href, "Invalid URL")
 	}
@@ -506,7 +511,7 @@ func urlSearchParams(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value
 	if paramsProto == nil {
 		return ctx.ThrowTypeError("URLSearchParams prototype is unavailable")
 	}
-	result := newParamsObject(ctx, paramsProto, object, parsed.RawQuery)
+	result := newParamsObject(ctx, paramsProto, object, parsed.query())
 	paramsProto.Free()
 	if result == nil {
 		return nil
@@ -516,42 +521,26 @@ func urlSearchParams(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value
 }
 
 func urlPathname(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value {
-	return urlComponent(ctx, object, func(u *neturl.URL) string {
-		result := u.EscapedPath()
-		if result == "" && u.Host != "" && isSpecialScheme(u.Scheme) {
-			return "/"
-		}
-		return result
-	})
+	return urlComponent(ctx, object, func(u *parsedURL) string { return u.pathname() })
 }
 
 func urlPort(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value {
-	return urlComponent(ctx, object, func(u *neturl.URL) string { return u.Port() })
+	return urlComponent(ctx, object, func(u *parsedURL) string { return u.port() })
 }
 
 func urlProtocol(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value {
-	return urlComponent(ctx, object, func(u *neturl.URL) string { return u.Scheme + ":" })
+	return urlComponent(ctx, object, func(u *parsedURL) string { return u.protocol() })
 }
 
 func urlSearch(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value {
-	return urlComponent(ctx, object, func(u *neturl.URL) string {
-		if u.RawQuery == "" {
-			return ""
-		}
-		return "?" + u.RawQuery
-	})
+	return urlComponent(ctx, object, func(u *parsedURL) string { return u.search() })
 }
 
 func urlUsername(ctx *quickjs.Context, object *quickjs.Value) *quickjs.Value {
-	return urlComponent(ctx, object, func(u *neturl.URL) string {
-		if u.User == nil {
-			return ""
-		}
-		return u.User.Username()
-	})
+	return urlComponent(ctx, object, func(u *parsedURL) string { return u.username() })
 }
 
-func urlComponent(ctx *quickjs.Context, object *quickjs.Value, component func(*neturl.URL) string) *quickjs.Value {
+func urlComponent(ctx *quickjs.Context, object *quickjs.Value, component func(*parsedURL) string) *quickjs.Value {
 	state := getURLState(object)
 	if state == nil {
 		return throwURLInvalidThis(ctx, "Value of this must be of type URL")
@@ -569,33 +558,15 @@ func urlComponent(ctx *quickjs.Context, object *quickjs.Value, component func(*n
 }
 
 func setURLHash(ctx *quickjs.Context, object, value *quickjs.Value) *quickjs.Value {
-	text := valueString(value)
-	if strings.HasPrefix(text, "#") {
-		text = text[1:]
-	}
-	return updateURL(ctx, object, func(u *neturl.URL) { u.Fragment = text })
+	return updateURL(ctx, object, func(u *parsedURL) { u.setHash(valueString(value)) })
 }
 
 func setURLHost(ctx *quickjs.Context, object, value *quickjs.Value) *quickjs.Value {
-	text := valueString(value)
-	return updateURL(ctx, object, func(u *neturl.URL) { u.Host = text })
+	return updateURL(ctx, object, func(u *parsedURL) { u.setHost(valueString(value)) })
 }
 
 func setURLHostname(ctx *quickjs.Context, object, value *quickjs.Value) *quickjs.Value {
-	text := valueString(value)
-	if strings.Contains(text, ":") {
-		return nil
-	}
-	return updateURL(ctx, object, func(u *neturl.URL) {
-		if _, err := neturl.ParseRequestURI(u.Scheme + "://" + text); err != nil {
-			return
-		}
-		if port := u.Port(); port != "" {
-			u.Host = text + ":" + port
-		} else {
-			u.Host = text
-		}
-	})
+	return updateURL(ctx, object, func(u *parsedURL) { u.setHostname(valueString(value)) })
 }
 
 func setURLHref(ctx *quickjs.Context, object, value *quickjs.Value) *quickjs.Value {
@@ -614,209 +585,40 @@ func setURLHref(ctx *quickjs.Context, object, value *quickjs.Value) *quickjs.Val
 }
 
 func setURLPassword(ctx *quickjs.Context, object, value *quickjs.Value) *quickjs.Value {
-	text := valueString(value)
-	return updateURL(ctx, object, func(u *neturl.URL) {
-		username := ""
-		if u.User != nil {
-			username = u.User.Username()
-		}
-		u.User = neturl.UserPassword(username, text)
-	})
+	return updateURL(ctx, object, func(u *parsedURL) { u.setPassword(valueString(value)) })
 }
 
 func setURLPathname(ctx *quickjs.Context, object, value *quickjs.Value) *quickjs.Value {
-	text := valueString(value)
-	return updateURL(ctx, object, func(u *neturl.URL) { u.Path = text })
+	return updateURL(ctx, object, func(u *parsedURL) { u.setPathname(valueString(value)) })
 }
 
 func setURLPort(ctx *quickjs.Context, object, value *quickjs.Value) *quickjs.Value {
-	return updateURL(ctx, object, func(u *neturl.URL) {
-		if u.Scheme == "file" {
-			return
-		}
-		port, empty := urlPortValue(value)
-		if empty {
-			u.Host = u.Hostname()
-			return
-		}
-		if port < 0 {
-			return
-		}
-		host := u.Hostname()
-		if defaultPort(u.Scheme, port) {
-			u.Host = host
-			return
-		}
-		u.Host = net.JoinHostPort(host, strconv.Itoa(port))
-	})
-}
-
-func urlPortValue(value *quickjs.Value) (port int, empty bool) {
-	port = -1
-	if value == nil {
-		return port, false
-	}
-	if value.IsNumber() {
-		number := value.ToFloat64()
-		if number < 0 {
-			return 0, true
-		}
-		if number == math.Trunc(number) && number <= math.MaxUint16 {
-			return int(number), false
-		}
-	}
-	text := value.ToString()
-	if text == "" {
-		return 0, true
-	}
-	firstDigit := -1
-	for index := 0; index < len(text); index++ {
-		if text[index] >= '0' && text[index] <= '9' {
-			firstDigit = index
-			break
-		}
-	}
-	if firstDigit < 0 {
-		return -1, false
-	}
-	if firstDigit > 0 {
-		return 0, true
-	}
-	port = 0
-	for index := firstDigit; index < len(text); index++ {
-		char := text[index]
-		if char < '0' || char > '9' {
-			break
-		}
-		port = port*10 + int(char-'0')
-		if port > math.MaxUint16 {
-			return -1, false
-		}
-	}
-	return port, false
+	return updateURL(ctx, object, func(u *parsedURL) { u.setPort(valueString(value)) })
 }
 
 func setURLProtocol(ctx *quickjs.Context, object, value *quickjs.Value) *quickjs.Value {
-	text := valueString(value)
-	if position := strings.IndexByte(text, ':'); position >= 0 {
-		text = text[:position]
-	}
-	text = strings.ToLower(text)
-	return updateURL(ctx, object, func(u *neturl.URL) {
-		if isSpecialScheme(text) != isSpecialScheme(u.Scheme) {
-			return
-		}
-		if _, err := neturl.ParseRequestURI(text + "://" + u.Host); err == nil {
-			u.Scheme = text
-		}
-	})
+	return updateURL(ctx, object, func(u *parsedURL) { u.setProtocol(valueString(value)) })
 }
 
 func setURLSearch(ctx *quickjs.Context, object, value *quickjs.Value) *quickjs.Value {
-	text := valueString(value)
-	text = strings.TrimPrefix(text, "?")
-	return updateURL(ctx, object, func(u *neturl.URL) { u.RawQuery = text })
+	return updateURL(ctx, object, func(u *parsedURL) { u.setSearch(valueString(value)) })
 }
 
 func setURLUsername(ctx *quickjs.Context, object, value *quickjs.Value) *quickjs.Value {
-	text := valueString(value)
-	return updateURL(ctx, object, func(u *neturl.URL) {
-		password, hasPassword := "", false
-		if u.User != nil {
-			password, hasPassword = u.User.Password()
-		}
-		if hasPassword {
-			u.User = neturl.UserPassword(text, password)
-		} else {
-			u.User = neturl.User(text)
-		}
-	})
+	return updateURL(ctx, object, func(u *parsedURL) { u.setUsername(valueString(value)) })
 }
 
 func valueString(value *quickjs.Value) string {
 	if value == nil {
 		return ""
 	}
+	if value.IsString() {
+		var text string
+		if json.Unmarshal([]byte(value.JSONStringify()), &text) == nil {
+			return text
+		}
+	}
 	return value.ToString()
-}
-
-func parseURL(input string, base *neturl.URL, requireAbsolute bool) (*neturl.URL, error) {
-	input = strings.TrimSpace(stripURLTabsAndNewlines(input))
-	parsed, err := neturl.Parse(input)
-	if err != nil {
-		return nil, err
-	}
-	if base != nil {
-		parsed = base.ResolveReference(parsed)
-	}
-	if requireAbsolute && !parsed.IsAbs() {
-		return nil, fmt.Errorf("URL is not absolute")
-	}
-	if parsed.Scheme == "" {
-		return nil, fmt.Errorf("URL has no scheme")
-	}
-	normalizeURL(parsed)
-	if isNetworkScheme(parsed.Scheme) && parsed.Host == "" {
-		return nil, fmt.Errorf("URL has no hostname")
-	}
-	return parsed, nil
-}
-
-func stripURLTabsAndNewlines(input string) string {
-	start := strings.IndexAny(input, "\t\n\r")
-	if start == -1 {
-		return input
-	}
-	var output strings.Builder
-	output.Grow(len(input) - 1)
-	output.WriteString(input[:start])
-	for index := start; index < len(input); index++ {
-		switch input[index] {
-		case '\t', '\n', '\r':
-			continue
-		default:
-			output.WriteByte(input[index])
-		}
-	}
-	return output.String()
-}
-
-func normalizeURL(u *neturl.URL) {
-	u.Scheme = strings.ToLower(u.Scheme)
-	if u.Path != "" {
-		if !strings.HasPrefix(u.Path, "/") && (isSpecialScheme(u.Scheme) || u.Path != "") {
-			u.Path = "/" + u.Path
-		}
-		cleaned := path.Clean(u.Path)
-		if strings.HasSuffix(u.Path, "/") && !strings.HasSuffix(cleaned, "/") {
-			cleaned += "/"
-		}
-		u.Path = cleaned
-		u.RawPath = ""
-	} else if u.Scheme == "file" || (isSpecialScheme(u.Scheme) && u.Host != "") {
-		u.Path = "/"
-	}
-	if isNetworkScheme(u.Scheme) && u.Host != "" {
-		host := u.Hostname()
-		if ascii, err := idna.ToASCII(strings.ToLower(host)); err == nil {
-			host = ascii
-		}
-		port := u.Port()
-		if port != "" {
-			p, err := strconv.Atoi(port)
-			if err == nil && defaultPort(u.Scheme, p) {
-				port = ""
-			}
-		}
-		if strings.Contains(host, ":") {
-			u.Host = net.JoinHostPort(host, port)
-		} else if port != "" {
-			u.Host = host + ":" + port
-		} else {
-			u.Host = host
-		}
-	}
-	u.RawQuery = escapeURLQuery(u.RawQuery)
 }
 
 func isSpecialScheme(scheme string) bool {
@@ -873,29 +675,103 @@ func throwURLMissingArgs(ctx *quickjs.Context, format string, args ...any) *quic
 
 func paramsInput(ctx *quickjs.Context, value *quickjs.Value) (string, *quickjs.Value) {
 	if value.IsString() {
-		return strings.TrimPrefix(value.ToString(), "?"), nil
+		return strings.TrimPrefix(valueString(value), "?"), nil
 	}
 	if value.IsObject() {
+		if isDOMExceptionPrototype(ctx, value) {
+			return "", ctx.ThrowTypeError("Value of this must be of type DOMException")
+		}
 		if pairs, found, failure := paramsIterable(ctx, value); found {
 			if failure != nil {
 				return "", failure
 			}
 			return encodeParams(pairs), nil
 		}
-		names, err := value.PropertyNames()
-		if err == nil {
-			pairs := make([]paramPair, 0, len(names))
-			for _, name := range names {
-				field := value.Get(name)
-				if field != nil {
-					pairs = append(pairs, paramPair{name: name, value: field.ToString()})
-					field.Free()
-				}
-			}
-			return encodeParams(pairs), nil
+		pairs, failure := paramsRecord(ctx, value)
+		if failure != nil {
+			return "", failure
 		}
+		return encodeParams(pairs), nil
 	}
-	return value.ToString(), nil
+	return valueString(value), nil
+}
+
+func isDOMExceptionPrototype(ctx *quickjs.Context, value *quickjs.Value) bool {
+	constructor := ctx.Globals().Get("DOMException")
+	if constructor == nil {
+		return false
+	}
+	defer constructor.Free()
+	prototype := constructor.Get("prototype")
+	if prototype == nil {
+		return false
+	}
+	defer prototype.Free()
+	return value.StrictEqual(prototype)
+}
+
+func paramsRecord(ctx *quickjs.Context, value *quickjs.Value) ([]paramPair, *quickjs.Value) {
+	object := ctx.Globals().Get("Object")
+	if object == nil {
+		return nil, ctx.ThrowInternalError("Object constructor is unavailable")
+	}
+	defer object.Free()
+	keys := object.Get("keys")
+	if keys == nil {
+		return nil, ctx.ThrowInternalError("Object.keys is unavailable")
+	}
+	defer keys.Free()
+	names := keys.Execute(object, value)
+	if names == nil {
+		return nil, ctx.ThrowInternalError("Object.keys failed")
+	}
+	if names.IsException() {
+		return nil, names
+	}
+	defer names.Free()
+	length := names.Get("length")
+	if length == nil {
+		return nil, ctx.ThrowInternalError("Object.keys returned an invalid value")
+	}
+	count := length.ToInt64()
+	length.Free()
+	reflect := ctx.Globals().Get("Reflect")
+	if reflect == nil {
+		return nil, ctx.ThrowInternalError("Reflect object is unavailable")
+	}
+	defer reflect.Free()
+	get := reflect.Get("get")
+	if get == nil {
+		return nil, ctx.ThrowInternalError("Reflect.get is unavailable")
+	}
+	defer get.Free()
+
+	pairs := make([]paramPair, 0, count)
+	indexByName := make(map[string]int, count)
+	for index := int64(0); index < count; index++ {
+		nameValue := names.GetIdx(index)
+		if nameValue == nil {
+			return nil, ctx.ThrowInternalError("Object.keys returned an invalid property name")
+		}
+		name := valueString(nameValue)
+		field := get.Execute(reflect, value, nameValue)
+		nameValue.Free()
+		if field == nil {
+			return nil, ctx.ThrowInternalError("could not read parameter record property")
+		}
+		if field.IsException() {
+			return nil, field
+		}
+		fieldValue := valueString(field)
+		if pairIndex, found := indexByName[name]; found {
+			pairs[pairIndex].value = fieldValue
+		} else {
+			indexByName[name] = len(pairs)
+			pairs = append(pairs, paramPair{name: name, value: fieldValue})
+		}
+		field.Free()
+	}
+	return pairs, nil
 }
 
 func paramsIterable(ctx *quickjs.Context, value *quickjs.Value) ([]paramPair, bool, *quickjs.Value) {
@@ -1053,9 +929,9 @@ func paramsTupleFromIterable(ctx *quickjs.Context, entry *quickjs.Value, iterato
 			return pair, true, item
 		}
 		if count == 0 {
-			pair.name = item.ToString()
+			pair.name = valueString(item)
 		} else {
-			pair.value = item.ToString()
+			pair.value = valueString(item)
 		}
 		item.Free()
 		count++
@@ -1072,7 +948,6 @@ type paramPair struct {
 }
 
 func parseParams(query string) []paramPair {
-	query = strings.TrimPrefix(query, "?")
 	if query == "" {
 		return nil
 	}
@@ -1152,8 +1027,8 @@ func paramsQuery(state *quickjs.Value) string {
 			urlState.Free()
 			owner.Free()
 			owner = nil
-			if u, err := neturl.Parse(href); err == nil {
-				return u.RawQuery
+			if u, err := parseURL(href, nil, false); err == nil {
+				return u.query()
 			}
 		}
 	}
@@ -1170,9 +1045,8 @@ func setParamsQuery(ctx *quickjs.Context, state *quickjs.Value, query string) {
 		urlState := getURLState(owner)
 		if urlState != nil {
 			href, _ := stateString(urlState, "href")
-			if u, err := neturl.Parse(href); err == nil {
-				u.RawQuery = query
-				normalizeURL(u)
+			if u, err := parseURL(href, nil, false); err == nil {
+				u.setSearch(query)
 				urlState.Set("href", ctx.NewString(u.String()))
 			}
 			urlState.Free()
@@ -1200,7 +1074,7 @@ func paramsAppend(ctx *quickjs.Context, this *quickjs.Value, args []*quickjs.Val
 	}
 	defer state.Free()
 	pairs := paramsPairs(state)
-	pairs = append(pairs, paramPair{name: args[0].ToString(), value: args[1].ToString()})
+	pairs = append(pairs, paramPair{name: valueString(args[0]), value: valueString(args[1])})
 	setParamsQuery(ctx, state, encodeParams(pairs))
 	return nil
 }
@@ -1213,16 +1087,16 @@ func paramsDelete(ctx *quickjs.Context, this *quickjs.Value, args []*quickjs.Val
 	if len(args) == 0 {
 		return throwURLMissingArgs(ctx, "The \"name\" argument must be specified")
 	}
-	name := args[0].ToString()
+	name := valueString(args[0])
 	value := ""
 	hasValue := len(args) > 1 && args[1] != nil && !args[1].IsUndefined()
 	if hasValue {
-		value = args[1].ToString()
+		value = valueString(args[1])
 	}
 	pairs := paramsPairs(state)
 	filtered := pairs[:0]
 	for _, pair := range pairs {
-		remove := pair.name == name && (len(args) == 1 || hasValue && pair.value == value)
+		remove := pair.name == name && (!hasValue || pair.value == value)
 		if !remove {
 			filtered = append(filtered, pair)
 		}
@@ -1240,7 +1114,7 @@ func paramsGet(ctx *quickjs.Context, this *quickjs.Value, args []*quickjs.Value)
 	if len(args) == 0 {
 		return throwURLMissingArgs(ctx, "The \"name\" argument must be specified")
 	}
-	name := args[0].ToString()
+	name := valueString(args[0])
 	for _, pair := range paramsPairs(state) {
 		if pair.name == name {
 			return ctx.NewString(pair.value)
@@ -1258,7 +1132,7 @@ func paramsGetAll(ctx *quickjs.Context, this *quickjs.Value, args []*quickjs.Val
 	if len(args) == 0 {
 		return throwURLMissingArgs(ctx, "The \"name\" argument must be specified")
 	}
-	name := args[0].ToString()
+	name := valueString(args[0])
 	values := make([]string, 0)
 	for _, pair := range paramsPairs(state) {
 		if pair.name == name {
@@ -1281,11 +1155,11 @@ func paramsHas(ctx *quickjs.Context, this *quickjs.Value, args []*quickjs.Value)
 	if len(args) == 0 {
 		return throwURLMissingArgs(ctx, "The \"name\" argument must be specified")
 	}
-	name := args[0].ToString()
+	name := valueString(args[0])
 	hasValue := len(args) > 1 && args[1] != nil && !args[1].IsUndefined()
 	value := ""
 	if hasValue {
-		value = args[1].ToString()
+		value = valueString(args[1])
 	}
 	for _, pair := range paramsPairs(state) {
 		if pair.name == name && (!hasValue || pair.value == value) {
@@ -1304,7 +1178,7 @@ func paramsSet(ctx *quickjs.Context, this *quickjs.Value, args []*quickjs.Value)
 	if len(args) < 2 {
 		return throwURLMissingArgs(ctx, "The \"name\" and \"value\" arguments must be specified")
 	}
-	name, value := args[0].ToString(), args[1].ToString()
+	name, value := valueString(args[0]), valueString(args[1])
 	pairs := paramsPairs(state)
 	result := make([]paramPair, 0, len(pairs)+1)
 	found := false
@@ -1325,6 +1199,51 @@ func paramsSet(ctx *quickjs.Context, this *quickjs.Value, args []*quickjs.Value)
 	return nil
 }
 
+func compareUTF16(left, right string) int {
+	leftOffset, rightOffset := 0, 0
+	var leftTrailing, rightTrailing uint16
+	leftHasTrailing, rightHasTrailing := false, false
+	for {
+		leftUnit, leftOK := nextUTF16CodeUnit(left, &leftOffset, &leftTrailing, &leftHasTrailing)
+		rightUnit, rightOK := nextUTF16CodeUnit(right, &rightOffset, &rightTrailing, &rightHasTrailing)
+		if !leftOK || !rightOK {
+			switch {
+			case leftOK:
+				return 1
+			case rightOK:
+				return -1
+			default:
+				return 0
+			}
+		}
+		switch {
+		case leftUnit < rightUnit:
+			return -1
+		case leftUnit > rightUnit:
+			return 1
+		}
+	}
+}
+
+func nextUTF16CodeUnit(input string, offset *int, trailing *uint16, hasTrailing *bool) (uint16, bool) {
+	if *hasTrailing {
+		*hasTrailing = false
+		return *trailing, true
+	}
+	if *offset == len(input) {
+		return 0, false
+	}
+	runeValue, size := utf8.DecodeRuneInString(input[*offset:])
+	*offset += size
+	if runeValue <= 0xFFFF {
+		return uint16(runeValue), true
+	}
+	runeValue -= 0x10000
+	*trailing = 0xDC00 + uint16(runeValue&0x3FF)
+	*hasTrailing = true
+	return 0xD800 + uint16(runeValue>>10), true
+}
+
 func paramsSort(ctx *quickjs.Context, this *quickjs.Value, _ []*quickjs.Value) *quickjs.Value {
 	state := getParamsState(this)
 	if state == nil {
@@ -1332,7 +1251,7 @@ func paramsSort(ctx *quickjs.Context, this *quickjs.Value, _ []*quickjs.Value) *
 	}
 	defer state.Free()
 	pairs := paramsPairs(state)
-	sort.SliceStable(pairs, func(i, j int) bool { return pairs[i].name < pairs[j].name })
+	sort.SliceStable(pairs, func(i, j int) bool { return compareUTF16(pairs[i].name, pairs[j].name) < 0 })
 	setParamsQuery(ctx, state, encodeParams(pairs))
 	return nil
 }

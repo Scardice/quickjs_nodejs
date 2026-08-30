@@ -1,5 +1,7 @@
 declare module "url" {
   export class URL {
+    static canParse(input: string, base?: string | URL): boolean;
+    static parse(input: string, base?: string | URL): URL | null;
     constructor(input: string, base?: string | URL);
     hash: string;
     host: string;

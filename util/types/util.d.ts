@@ -24,8 +24,3 @@ declare module "node:util" {
   export * from "util";
   export { default } from "util";
 }
-
-declare module "@seal/utilinspect" {
-  export * from "util";
-  export { default } from "util";
-}

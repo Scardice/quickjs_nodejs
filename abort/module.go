@@ -29,6 +29,19 @@ const implementation = `(function () {
     return error;
   }
 
+  function makeAbortEvent(signal) {
+    return {
+      type: "abort",
+      target: signal,
+      currentTarget: signal,
+      bubbles: false,
+      cancelable: false,
+      composed: false,
+      isTrusted: true,
+      reason: signal.reason
+    };
+  }
+
   class AbortSignal {
     constructor() {
       this._aborted = false;
@@ -41,7 +54,7 @@ const implementation = `(function () {
     addEventListener(type, listener, options) {
       if (type !== "abort" || typeof listener !== "function") return;
       if (this._aborted) {
-        listener.call(this, { type: "abort", target: this, currentTarget: this, reason: this._reason });
+        listener.call(this, makeAbortEvent(this));
         return;
       }
       const once = !!(options && typeof options === "object" && options.once);
@@ -58,7 +71,7 @@ const implementation = `(function () {
       if (this._aborted) return;
       this._aborted = true;
       this._reason = reason === undefined ? makeReason("This operation was aborted", "AbortError") : reason;
-      const event = { type: "abort", target: this, currentTarget: this, reason: this._reason };
+      const event = makeAbortEvent(this);
       const listeners = this._listeners.slice();
       this._listeners = [];
       for (const entry of listeners) {
@@ -147,7 +160,7 @@ func exportValue(ctx *quickjs.Context, name string) (*quickjs.Value, error) {
 func Module() module.Definition {
 	return module.Definition{
 		Name:    ModuleName,
-		Aliases: []string{"node:" + ModuleName, "@seal/abort"},
+		Aliases: []string{"node:" + ModuleName},
 		Exports: []module.Export{
 			{Name: "AbortController", Spec: quickjs.FactorySpec{Factory: func(ctx *quickjs.Context) (*quickjs.Value, error) {
 				return exportValue(ctx, "AbortController")

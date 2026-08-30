@@ -15,8 +15,3 @@ declare module "node:structuredclone" {
   export * from "structuredclone";
   export { default } from "structuredclone";
 }
-
-declare module "@seal/structuredclone" {
-  export * from "structuredclone";
-  export { default } from "structuredclone";
-}

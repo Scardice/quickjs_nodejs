@@ -314,6 +314,149 @@ func TestFetchAbortCancelsInFlightTransport(t *testing.T) {
 
 }
 
+func TestFetchUsesBlobBodyAndReturnsBlob(t *testing.T) {
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		body, err := io.ReadAll(request.Body)
+		if err != nil {
+			return nil, err
+		}
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Header:     http.Header{"Content-Type": []string{"application/custom"}},
+			Body:       io.NopCloser(strings.NewReader(request.Header.Get("Content-Type") + "|" + string(body))),
+			Request:    request,
+		}, nil
+	})
+	loop, err := eventloop.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loop.Close()
+	if err := loop.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan string, 1)
+	if !loop.Schedule(func(ctx *quickjs.Context) error {
+		if err := InstallGlobal(ctx, WithTransport(transport)); err != nil {
+			return err
+		}
+		report := ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
+			if len(args) > 0 {
+				result <- args[0].ToString()
+			}
+			return ctx.NewUndefined()
+		})
+		ctx.Globals().Set("reportFetch", report)
+		value := ctx.Eval(`(async () => {
+			try {
+				const response = await fetch("https://example.test", {method: "POST", body: new Blob(["blob body"], {type: "text/plain"})});
+				const body = await response.blob();
+				reportFetch([Object.prototype.toString.call(body), body.type, await body.text()].join("|"));
+			} catch (error) {
+				reportFetch(error.name + ": " + error.message);
+			}
+		})()`)
+		if value == nil {
+			return &testError{"Blob fetch evaluation returned nil"}
+		}
+		if value.IsException() {
+			return ctx.Exception()
+		}
+		value.Free()
+		return nil
+	}) {
+		t.Fatal("fetch task was rejected")
+	}
+	select {
+	case got := <-result:
+		if want := "[object Blob]|application/custom|text/plain|blob body"; got != want {
+			t.Fatalf("Blob fetch result = %q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Blob fetch result timed out")
+	}
+}
+
+func TestHeadersPreservesSetCookieRecords(t *testing.T) {
+	loop, err := eventloop.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loop.Close()
+
+	var result string
+	if err := loop.Run(func(ctx *quickjs.Context) error {
+		if err := InstallGlobal(ctx); err != nil {
+			return err
+		}
+		value := ctx.Eval(`(() => {
+			const headers = new Headers();
+			headers.append("Set-Cookie", "a=1");
+			headers.append("Set-Cookie", "b=2");
+			return [headers.get("set-cookie"), headers.getSetCookie().join(";"), Array.from(headers).map(entry => entry.join(":")).join(";")].join("|");
+		})()`)
+		if value == nil {
+			return &testError{"Headers evaluation returned nil"}
+		}
+		defer value.Free()
+		if value.IsException() {
+			return ctx.Exception()
+		}
+		result = value.ToString()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := result, "a=1, b=2|a=1;b=2|set-cookie:a=1;set-cookie:b=2"; got != want {
+		t.Fatalf("Headers result = %q, want %q", got, want)
+	}
+}
+
+func TestHeadersUseLiveIteratorsAndResponseGuard(t *testing.T) {
+	loop, err := eventloop.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loop.Close()
+
+	var result string
+	if err := loop.Run(func(ctx *quickjs.Context) error {
+		if err := InstallGlobal(ctx); err != nil {
+			return err
+		}
+		value := ctx.Eval(`(() => {
+			const headers = new Headers([["fizz", "buzz"], ["x-header", "test"]]);
+			const iterator = headers.entries();
+			const first = iterator.next().value.join(":");
+			headers.append("set-cookie", "a=b");
+			const second = iterator.next().value.join(":");
+			headers.append("accept", "text/html");
+			const third = iterator.next().value.join(":");
+			const normalized = new Headers({"Set-Cookie": "  a=b\n"});
+			normalized.append("set-cookie", "\n\rc=d  ");
+			const response = new Response();
+			response.headers.append("set-cookie", "blocked=true");
+			return [first, second, third, Array.from(normalized).map(entry => entry.join(":")).join(";"), response.headers.getSetCookie().length].join("|");
+		})()`)
+		if value == nil {
+			return &testError{"Headers evaluation returned nil"}
+		}
+		defer value.Free()
+		if value.IsException() {
+			return ctx.Exception()
+		}
+		result = value.ToString()
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := result, "fizz:buzz|set-cookie:a=b|set-cookie:a=b|set-cookie:a=b;set-cookie:c=d|0"; got != want {
+		t.Fatalf("Headers result = %q, want %q", got, want)
+	}
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
