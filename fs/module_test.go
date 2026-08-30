@@ -9,9 +9,54 @@ import (
 	"time"
 
 	"github.com/Scardice/quickjs_nodejs/eventloop"
+	"github.com/Scardice/quickjs_nodejs/limits"
 	"github.com/Scardice/quickjs_nodejs/module"
 	quickjs "github.com/buke/quickjs-go"
 )
+
+func TestPromisesModuleRejectsReadPastConfiguredLimit(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "large.txt"), []byte("too-large"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	limitsRuntime, err := limits.NewRuntime(limits.Config{MaxFilesystemReadBytes: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := []Option{WithRoot(root), WithPolicy(func(Request) error { return nil }), WithResourceLimits(limitsRuntime)}
+	got := runFSProgram(t, []module.Definition{PromisesModule(options...)}, `async () => {
+		const fs = await import("node:fs/promises");
+		try {
+			await fs.readFile("large.txt");
+			return "fulfilled";
+		} catch {
+			return "rejected";
+		}
+	}`)
+	if got != "rejected" {
+		t.Fatalf("oversized read = %q, want rejected", got)
+	}
+}
+
+func TestPromisesModuleRejectsWritePastConfiguredLimit(t *testing.T) {
+	limitsRuntime, err := limits.NewRuntime(limits.Config{MaxFilesystemWriteBytes: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := []Option{WithRoot(t.TempDir()), WithPolicy(func(Request) error { return nil }), WithResourceLimits(limitsRuntime)}
+	got := runFSProgram(t, []module.Definition{PromisesModule(options...)}, `async () => {
+		const fs = await import("node:fs/promises");
+		try {
+			await fs.writeFile("large.txt", "too-large");
+			return "fulfilled";
+		} catch {
+			return "rejected";
+		}
+	}`)
+	if got != "rejected" {
+		t.Fatalf("oversized write = %q, want rejected", got)
+	}
+}
 
 func TestPromisesModuleReadsAndWritesAfterPolicyApproval(t *testing.T) {
 	root := t.TempDir()

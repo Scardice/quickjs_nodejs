@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Scardice/quickjs_nodejs/limits"
 	quickjs "github.com/buke/quickjs-go"
 )
 
@@ -376,5 +377,45 @@ func TestEventLoopCloseFromOwnerDoesNotDeadlock(t *testing.T) {
 	}
 	if !errors.Is(loop.Start(), ErrClosed) {
 		t.Fatal("Start did not return ErrClosed after owner Close")
+	}
+}
+
+func TestEventLoopExecuteTimeoutLeavesLoopUsable(t *testing.T) {
+	loop, err := New(WithResourceLimits(limits.Config{ExecuteTimeout: time.Second}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loop.Close()
+
+	err = loop.Run(func(ctx *quickjs.Context) error {
+		value := ctx.Eval(`while (true) {}`)
+		if value == nil {
+			return errors.New("infinite-loop evaluation returned nil")
+		}
+		defer value.Free()
+		if !value.IsException() {
+			return errors.New("infinite loop completed without an exception")
+		}
+		return ctx.Exception()
+	})
+	if err == nil {
+		t.Fatal("infinite loop completed without a timeout error")
+	}
+
+	if err := loop.Run(func(ctx *quickjs.Context) error {
+		value := ctx.Eval(`1 + 1`)
+		if value == nil {
+			return errors.New("post-timeout evaluation returned nil")
+		}
+		defer value.Free()
+		if value.IsException() {
+			return ctx.Exception()
+		}
+		if got := value.ToInt32(); got != 2 {
+			return fmt.Errorf("post-timeout result = %d", got)
+		}
+		return nil
+	}); err != nil {
+		t.Fatalf("event loop was not usable after timeout: %v", err)
 	}
 }

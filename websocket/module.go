@@ -112,7 +112,11 @@ func (builder *apiBuilder) build(ctx *quickjs.Context) (*quickjs.Value, error) {
 		if err != nil {
 			return ctx.ThrowTypeError("%s", err)
 		}
-		return ctx.NewString(runtime.open(args[0].ToString(), protocols))
+		id, err := runtime.open(args[0].ToString(), protocols)
+		if err != nil {
+			return ctx.ThrowError(err)
+		}
+		return ctx.NewString(id)
 	}))
 	native.Set("send", ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
 		if len(args) < 2 || args[0] == nil {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/Scardice/quickjs_nodejs/eventloop"
+	"github.com/Scardice/quickjs_nodejs/limits"
 	quickjs "github.com/buke/quickjs-go"
 	gorilla "github.com/gorilla/websocket"
 )
@@ -168,6 +169,73 @@ func TestWebSocketWithoutDialerEmitsErrorAndClose(t *testing.T) {
 type gorillaDialer struct {
 	dialer gorilla.Dialer
 }
+
+func TestWebSocketConnectionLimitReleasesAfterClose(t *testing.T) {
+	limitsRuntime, err := limits.NewRuntime(limits.Config{MaxWebSocketConnections: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	dialer := DialerFunc(func(ctx context.Context, _ string, _ http.Header) (Conn, *http.Response, error) {
+		<-ctx.Done()
+		return nil, nil, ctx.Err()
+	})
+
+	loop, err := eventloop.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loop.Close()
+	if err := loop.Run(func(ctx *quickjs.Context) error {
+		runtime := newRuntime(ctx, applyOptions([]Option{WithDialer(dialer), WithResourceLimits(limitsRuntime)}), "__test_websocket")
+		first, err := runtime.open("ws://example.test/first", nil)
+		if err != nil {
+			return err
+		}
+		if _, err := runtime.open("ws://example.test/second", nil); err == nil {
+			return errors.New("second websocket bypassed the configured connection limit")
+		}
+		runtime.close(first, 1000, "")
+		if _, err := runtime.open("ws://example.test/third", nil); err != nil {
+			return err
+		}
+		return runtime.Close()
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestWebSocketAppliesConfiguredMessageLimit(t *testing.T) {
+	limitsRuntime, err := limits.NewRuntime(limits.Config{MaxWebSocketMessageBytes: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loop, err := eventloop.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loop.Close()
+	if err := loop.Run(func(ctx *quickjs.Context) error {
+		runtime := newRuntime(ctx, applyOptions([]Option{WithResourceLimits(limitsRuntime)}), "__test_websocket")
+		conn := &recordingReadLimitConn{}
+		connection := &connection{runtime: runtime, state: connectingState}
+		if !connection.attach(conn) {
+			return errors.New("test connection did not attach")
+		}
+		if conn.limit != 2 {
+			return errors.New("websocket message limit was not applied")
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type recordingReadLimitConn struct{ limit int64 }
+
+func (*recordingReadLimitConn) ReadMessage() (int, []byte, error) { return 0, nil, nil }
+func (*recordingReadLimitConn) WriteMessage(int, []byte) error    { return nil }
+func (*recordingReadLimitConn) Close() error                      { return nil }
+func (conn *recordingReadLimitConn) SetReadLimit(limit int64)     { conn.limit = limit }
 
 func (d *gorillaDialer) DialContext(ctx context.Context, url string, header http.Header) (Conn, *http.Response, error) {
 	conn, response, err := d.dialer.DialContext(ctx, url, header)

@@ -5,17 +5,17 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/Scardice/quickjs_nodejs/blob"
+	"github.com/Scardice/quickjs_nodejs/buffer"
+	"github.com/Scardice/quickjs_nodejs/eventloop"
+	"github.com/Scardice/quickjs_nodejs/limits"
+	"github.com/Scardice/quickjs_nodejs/module"
+	quickjs "github.com/buke/quickjs-go"
 	"io"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync/atomic"
-
-	"github.com/Scardice/quickjs_nodejs/blob"
-	"github.com/Scardice/quickjs_nodejs/buffer"
-	"github.com/Scardice/quickjs_nodejs/eventloop"
-	"github.com/Scardice/quickjs_nodejs/module"
-	quickjs "github.com/buke/quickjs-go"
 )
 
 const ModuleName = "fetch"
@@ -23,8 +23,9 @@ const ModuleName = "fetch"
 type Policy func(*http.Request) error
 
 type Config struct {
-	Transport http.RoundTripper
-	Policy    Policy
+	Transport      http.RoundTripper
+	Policy         Policy
+	ResourceLimits *limits.Runtime
 }
 
 type Option func(*Config)
@@ -35,6 +36,12 @@ func WithTransport(transport http.RoundTripper) Option {
 
 func WithPolicy(policy Policy) Option {
 	return func(config *Config) { config.Policy = policy }
+}
+
+// WithResourceLimits shares one runtime-local resource policy between fetch
+// module exports and the fetch global.
+func WithResourceLimits(resourceLimits *limits.Runtime) Option {
+	return func(config *Config) { config.ResourceLimits = resourceLimits }
 }
 
 var apiSequence atomic.Uint64
@@ -479,11 +486,17 @@ func performFetch(ctx *quickjs.Context, runtime *fetchRuntime, args []*quickjs.V
 		return rejectedFetchHandle(ctx, errors.New("The operation was aborted"))
 	}
 
+	release, err := config.ResourceLimits.AcquireFetch()
+	if err != nil {
+		return rejectedFetchHandle(ctx, err)
+	}
+
 	requestContext, cancel := context.WithCancel(context.Background())
 	request = request.WithContext(requestContext)
-	requestID, err := runtime.register(cancel)
+	requestID, err := runtime.register(cancel, release)
 	if err != nil {
 		cancel()
+		release()
 		return rejectedFetchHandle(ctx, err)
 	}
 
@@ -507,11 +520,7 @@ func performFetch(ctx *quickjs.Context, runtime *fetchRuntime, args []*quickjs.V
 				})
 				return
 			}
-			data := []byte(nil)
-			if response.Body != nil {
-				data, err = io.ReadAll(response.Body)
-				response.Body.Close()
-			}
+			data, err := readFetchBody(response.Body, config.ResourceLimits.Config().MaxFetchResponseBytes)
 			if err != nil {
 				fetchErr := err
 				scheduleFetch(ctx, runtime, requestID, func(inner *quickjs.Context) {
@@ -556,11 +565,42 @@ func performFetch(ctx *quickjs.Context, runtime *fetchRuntime, args []*quickjs.V
 
 func scheduleFetch(ctx *quickjs.Context, runtime *fetchRuntime, requestID string, task func(*quickjs.Context)) {
 	if ctx == nil || runtime == nil || task == nil || !ctx.Schedule(func(inner *quickjs.Context) {
+
 		runtime.complete(requestID)
 		task(inner)
 	}) {
 		if runtime != nil {
 			runtime.complete(requestID)
+		}
+	}
+}
+
+func readFetchBody(body io.ReadCloser, maxBytes int64) ([]byte, error) {
+	if body == nil {
+		return nil, nil
+	}
+	defer body.Close()
+	if maxBytes == 0 {
+		return io.ReadAll(body)
+	}
+
+	var data bytes.Buffer
+	var chunk [32 * 1024]byte
+	for {
+		count, err := body.Read(chunk[:])
+		if count > 0 {
+			if int64(count) > maxBytes-int64(data.Len()) {
+				return nil, errors.New("fetch: response body exceeds configured byte limit")
+			}
+			if _, writeErr := data.Write(chunk[:count]); writeErr != nil {
+				return nil, writeErr
+			}
+		}
+		if errors.Is(err, io.EOF) {
+			return data.Bytes(), nil
+		}
+		if err != nil {
+			return nil, err
 		}
 	}
 }

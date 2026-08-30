@@ -147,7 +147,7 @@ func (l *EventLoop) ContextTask(task func(*Context) error) error {
 		if l.closed.Load() || l.state == stateClosed {
 			return ErrClosed
 		}
-		return task(l.adapter)
+		return l.runContextTask(task)
 	}
 	return l.call(command{kind: commandContextTask, contextTask: task})
 }
@@ -167,7 +167,7 @@ func (l *EventLoop) DoContext(task func(*Context) error) error {
 		if l.state != stateRunning {
 			return ErrStopped
 		}
-		return task(l.adapter)
+		return l.runContextTask(task)
 	}
 	return l.call(command{kind: commandDoContextTask, contextTask: task})
 }
@@ -199,7 +199,7 @@ func (l *EventLoop) runContextOnOwner(task func(*Context) error) error {
 }
 
 func (l *EventLoop) runContextUntilIdle(task func(*Context) error) error {
-	if err := task(l.adapter); err != nil {
+	if err := l.runContextTask(task); err != nil {
 		l.state = stateStopped
 		return err
 	}

@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Scardice/quickjs_nodejs/limits"
 	"github.com/Scardice/quickjs_nodejs/module"
 	quickjs "github.com/buke/quickjs-go"
 )
@@ -61,10 +62,11 @@ func (discardLogger) Error(string)          {}
 func (discardLogger) Errorf(string, ...any) {}
 
 type config struct {
-	registry     *module.Registry
-	globals      []GlobalInstaller
-	logger       Logger
-	moduleImport bool
+	registry       *module.Registry
+	globals        []GlobalInstaller
+	logger         Logger
+	moduleImport   bool
+	resourceLimits limits.Config
 }
 
 // Option configures a new EventLoop.
@@ -102,6 +104,14 @@ func WithLogger(logger Logger) Option {
 		if logger != nil {
 			cfg.logger = logger
 		}
+	}
+}
+
+// WithResourceLimits configures opt-in CPU execution limits for the owner
+// runtime. Zero values retain the existing unlimited behavior.
+func WithResourceLimits(resourceLimits limits.Config) Option {
+	return func(cfg *config) {
+		cfg.resourceLimits = resourceLimits
 	}
 }
 
@@ -154,10 +164,11 @@ type EventLoop struct {
 	nextID    atomic.Uint64
 	ownerGID  atomic.Uint64
 
-	logger       Logger
-	registry     *module.Registry
-	globals      []GlobalInstaller
-	moduleImport bool
+	logger         Logger
+	registry       *module.Registry
+	globals        []GlobalInstaller
+	moduleImport   bool
+	resourceLimits limits.Config
 
 	rt  *quickjs.Runtime
 	ctx *quickjs.Context
@@ -183,16 +194,20 @@ func New(opts ...Option) (*EventLoop, error) {
 			option(&cfg)
 		}
 	}
+	if err := cfg.resourceLimits.Validate(); err != nil {
+		return nil, err
+	}
+
 	loop := &EventLoop{
-		commands:     make(chan command, 256),
-		wakeup:       make(chan struct{}, 1),
-		ready:        make(chan error, 1),
-		done:         make(chan struct{}),
-		logger:       cfg.logger,
-		registry:     cfg.registry,
-		globals:      append([]GlobalInstaller(nil), cfg.globals...),
-		moduleImport: cfg.moduleImport,
-		state:        stateNew,
+		commands:       make(chan command, 256),
+		wakeup:         make(chan struct{}, 1),
+		ready:          make(chan error, 1),
+		done:           make(chan struct{}),
+		logger:         cfg.logger,
+		registry:       cfg.registry,
+		globals:        append([]GlobalInstaller(nil), cfg.globals...),
+		moduleImport:   cfg.moduleImport,
+		resourceLimits: cfg.resourceLimits,
 	}
 	go loop.owner()
 	if err := <-loop.ready; err != nil {
@@ -507,7 +522,7 @@ func (l *EventLoop) handleCommand(cmd command) {
 		} else if l.state != stateRunning {
 			err = ErrStopped
 		} else {
-			err = runTask(l.ctx, cmd.task)
+			err = l.runTask(cmd.task)
 		}
 	case commandRun:
 		if l.state == stateClosed || l.closed.Load() {
@@ -522,7 +537,7 @@ func (l *EventLoop) handleCommand(cmd command) {
 		if l.state == stateClosed || l.closed.Load() {
 			err = ErrClosed
 		} else {
-			err = cmd.contextTask(l.adapter)
+			err = l.runContextTask(cmd.contextTask)
 		}
 	case commandDoContextTask:
 		if l.state == stateClosed || l.closed.Load() {
@@ -530,7 +545,7 @@ func (l *EventLoop) handleCommand(cmd command) {
 		} else if l.state != stateRunning {
 			err = ErrStopped
 		} else {
-			err = cmd.contextTask(l.adapter)
+			err = l.runContextTask(cmd.contextTask)
 		}
 	case commandRunContext:
 		if l.state == stateClosed || l.closed.Load() {
@@ -557,7 +572,7 @@ func (l *EventLoop) handleCommand(cmd command) {
 }
 
 func (l *EventLoop) runUntilIdle(task Task) error {
-	if err := runTask(l.ctx, task); err != nil {
+	if err := l.runTask(task); err != nil {
 		l.state = stateStopped
 		return err
 	}
@@ -583,7 +598,7 @@ func (l *EventLoop) pumpOnce() bool {
 		task := l.tasks[0]
 		l.tasks[0] = nil
 		l.tasks = l.tasks[1:]
-		if err := runTask(l.ctx, task); err != nil {
+		if err := l.runTask(task); err != nil {
 			l.logger.Errorf("event loop background task failed: %v", err)
 		}
 		progressed = true
@@ -593,11 +608,13 @@ func (l *EventLoop) pumpOnce() bool {
 	if l.state != stateRunning {
 		return progressed
 	}
-
-	l.ctx.ProcessJobs()
-	if l.ctx.LoopOnce() == 0 {
-		progressed = true
-	}
+	_ = l.withExecuteTimeout(func() error {
+		l.ctx.ProcessJobs()
+		if l.ctx.LoopOnce() == 0 {
+			progressed = true
+		}
+		return nil
+	})
 	return progressed
 }
 
@@ -628,7 +645,7 @@ func (l *EventLoop) fireDueTimer() bool {
 	if entry.handle.isCancelled() {
 		return true
 	}
-	if err := runTask(l.ctx, entry.task); err != nil {
+	if err := l.runTask(entry.task); err != nil {
 		l.logger.Errorf("event loop timer failed: %v", err)
 	}
 	if entry.kind == timerInterval && !entry.handle.isCancelled() && l.state == stateRunning {
@@ -682,6 +699,40 @@ func (l *EventLoop) closeOnOwner() {
 	l.state = stateClosed
 	l.closed.Store(true)
 	l.disposeGeneration()
+}
+
+func (l *EventLoop) runTask(task Task) error {
+	return l.withExecuteTimeout(func() error {
+		return runTask(l.ctx, task)
+	})
+}
+
+func (l *EventLoop) runContextTask(task func(*Context) error) error {
+	if task == nil {
+		return ErrNilTask
+	}
+	return l.withExecuteTimeout(func() error {
+		return task(l.adapter)
+	})
+}
+
+func (l *EventLoop) withExecuteTimeout(run func() error) error {
+	if run == nil {
+		return nil
+	}
+	if l == nil || l.rt == nil || l.resourceLimits.ExecuteTimeout <= 0 {
+		return run()
+	}
+	timeoutSeconds := uint64(l.resourceLimits.ExecuteTimeout / time.Second)
+	if l.resourceLimits.ExecuteTimeout%time.Second != 0 {
+		timeoutSeconds++
+	}
+	if timeoutSeconds == 0 {
+		timeoutSeconds = 1
+	}
+	l.rt.SetExecuteTimeout(timeoutSeconds)
+	defer l.rt.SetExecuteTimeout(0)
+	return run()
 }
 func (l *EventLoop) isOwner() bool {
 	return l.ownerInit && l.ownerGID.Load() != 0 && l.ownerGID.Load() == currentGoroutineID()

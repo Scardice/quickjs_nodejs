@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/Scardice/quickjs_nodejs/buffer"
+	"github.com/Scardice/quickjs_nodejs/limits"
 	quickjs "github.com/buke/quickjs-go"
 	gorilla "github.com/gorilla/websocket"
 )
@@ -31,6 +32,10 @@ type Conn interface {
 	Close() error
 }
 
+type readLimitConn interface {
+	SetReadLimit(int64)
+}
+
 type Dialer interface {
 	DialContext(ctx context.Context, urlStr string, requestHeader http.Header) (Conn, *http.Response, error)
 }
@@ -44,9 +49,10 @@ func (dialer DialerFunc) DialContext(ctx context.Context, urlStr string, request
 type Policy func(*url.URL) error
 
 type Config struct {
-	Dialer  Dialer
-	Headers http.Header
-	Policy  Policy
+	Dialer         Dialer
+	Headers        http.Header
+	Policy         Policy
+	ResourceLimits *limits.Runtime
 }
 
 type Option func(*Config)
@@ -61,6 +67,12 @@ func WithHeaders(headers http.Header) Option {
 
 func WithPolicy(policy Policy) Option {
 	return func(config *Config) { config.Policy = policy }
+}
+
+// WithResourceLimits shares one runtime-local connection policy between
+// WebSocket module exports and WebSocket globals.
+func WithResourceLimits(resourceLimits *limits.Runtime) Option {
+	return func(config *Config) { config.ResourceLimits = resourceLimits }
 }
 
 func applyOptions(options []Option) Config {
@@ -90,6 +102,7 @@ type connection struct {
 	id      string
 	ctx     context.Context
 	cancel  context.CancelFunc
+	release func()
 
 	mu          sync.Mutex
 	conn        Conn
@@ -109,9 +122,13 @@ func newRuntime(ctx *quickjs.Context, config Config, apiKey string) *runtime {
 	}
 }
 
-func (r *runtime) open(rawURL string, protocols []string) string {
+func (r *runtime) open(rawURL string, protocols []string) (string, error) {
 	if r == nil {
-		return ""
+		return "", errors.New("websocket: runtime is closed")
+	}
+	release, err := r.config.ResourceLimits.AcquireWebSocket()
+	if err != nil {
+		return "", err
 	}
 	id := fmt.Sprintf("ws-%d", r.nextID.Add(1))
 	connectCtx, cancel := context.WithCancel(context.Background())
@@ -120,18 +137,20 @@ func (r *runtime) open(rawURL string, protocols []string) string {
 		id:      id,
 		ctx:     connectCtx,
 		cancel:  cancel,
+		release: release,
 		state:   connectingState,
 	}
 	r.mu.Lock()
 	if r.closed.Load() {
 		r.mu.Unlock()
 		cancel()
-		return ""
+		release()
+		return "", errors.New("websocket: runtime is closed")
 	}
 	r.connections[id] = connection
 	r.mu.Unlock()
 	go r.connect(connection, rawURL, protocols)
-	return id
+	return id, nil
 }
 
 func (r *runtime) connect(connection *connection, rawURL string, protocols []string) {
@@ -263,6 +282,7 @@ func (r *runtime) finish(connection *connection, code int, reason string) {
 		connection.closeCode = code
 		connection.closeReason = reason
 		conn := connection.conn
+		release := connection.release
 		connection.mu.Unlock()
 		connection.cancel()
 		if conn != nil {
@@ -271,6 +291,9 @@ func (r *runtime) finish(connection *connection, code int, reason string) {
 		r.mu.Lock()
 		delete(r.connections, connection.id)
 		r.mu.Unlock()
+		if release != nil {
+			release()
+		}
 		r.scheduleEvent(connection.id, "close", nil, textMessage, code, reason)
 	})
 }
@@ -350,6 +373,11 @@ func (connection *connection) attach(conn Conn) bool {
 	defer connection.mu.Unlock()
 	if connection.state == closedState || connection.state == closingState {
 		return false
+	}
+	if limiter, ok := conn.(readLimitConn); ok {
+		if maxBytes := connection.runtime.config.ResourceLimits.Config().MaxWebSocketMessageBytes; maxBytes > 0 {
+			limiter.SetReadLimit(maxBytes)
+		}
 	}
 	connection.conn = conn
 	connection.state = openState

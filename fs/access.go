@@ -4,10 +4,13 @@ package fs
 import (
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/Scardice/quickjs_nodejs/limits"
 )
 
 const (
@@ -59,7 +62,6 @@ type SymlinkPolicy func(Request) error
 // on the QuickJS calling thread before a Promise operation starts.
 type PathResolver func(path string) (string, error)
 
-// Config controls one fs module instance.
 type Config struct {
 	Root               string
 	Policy             Policy
@@ -67,6 +69,7 @@ type Config struct {
 	SymlinkPolicy      SymlinkPolicy
 	UnrestrictedAccess bool
 	Sync               bool
+	ResourceLimits     *limits.Runtime
 }
 
 // Option configures one fs module instance.
@@ -106,6 +109,11 @@ func WithUnrestrictedAccess() Option {
 // remain available regardless of this setting.
 func WithSync(enabled bool) Option {
 	return func(config *Config) { config.Sync = enabled }
+}
+
+// WithResourceLimits applies one shared runtime-local byte policy to fs.
+func WithResourceLimits(resourceLimits *limits.Runtime) Option {
+	return func(config *Config) { config.ResourceLimits = resourceLimits }
 }
 
 func applyOptions(options []Option) Config {
@@ -184,14 +192,34 @@ func (a access) readFile(path string, encoding string, sync bool) (fileContents,
 	if err := a.authorize(OperationReadFile, virtual, "", sync, symlink); err != nil {
 		return fileContents{}, err
 	}
-	contents, err := os.ReadFile(target)
+	file, err := os.Open(target)
 	if err != nil {
 		return fileContents{}, err
+	}
+	defer file.Close()
+	maxBytes := a.config.ResourceLimits.Config().MaxFilesystemReadBytes
+	if maxBytes == 0 {
+		contents, err := io.ReadAll(file)
+		if err != nil {
+			return fileContents{}, err
+		}
+		return fileContents{data: contents, encoding: encoding}, nil
+	}
+	contents, err := io.ReadAll(io.LimitReader(file, maxBytes+1))
+	if err != nil {
+		return fileContents{}, err
+	}
+	if int64(len(contents)) > maxBytes {
+		return fileContents{}, errors.New("fs: file exceeds configured read byte limit")
 	}
 	return fileContents{data: contents, encoding: encoding}, nil
 }
 
 func (a access) writeFile(path string, data []byte, sync bool) error {
+	maxBytes := a.config.ResourceLimits.Config().MaxFilesystemWriteBytes
+	if maxBytes > 0 && int64(len(data)) > maxBytes {
+		return errors.New("fs: file exceeds configured write byte limit")
+	}
 	target, virtual, symlink, err := a.resolveWriteTarget(path)
 	if err != nil {
 		return err

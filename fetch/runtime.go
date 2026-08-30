@@ -16,17 +16,22 @@ type fetchRuntime struct {
 	nextID atomic.Uint64
 
 	mu       sync.Mutex
-	requests map[string]context.CancelFunc
+	requests map[string]fetchRequest
+}
+
+type fetchRequest struct {
+	cancel  context.CancelFunc
+	release func()
 }
 
 func newFetchRuntime(_ *quickjs.Context, config Config) *fetchRuntime {
 	return &fetchRuntime{
 		config:   config,
-		requests: make(map[string]context.CancelFunc),
+		requests: make(map[string]fetchRequest),
 	}
 }
 
-func (r *fetchRuntime) register(cancel context.CancelFunc) (string, error) {
+func (r *fetchRuntime) register(cancel context.CancelFunc, release func()) (string, error) {
 	if r == nil || cancel == nil {
 		return "", errors.New("fetch: runtime is closed")
 	}
@@ -36,7 +41,7 @@ func (r *fetchRuntime) register(cancel context.CancelFunc) (string, error) {
 		return "", errors.New("fetch: runtime is closed")
 	}
 	id := "fetch-" + formatID(r.nextID.Add(1))
-	r.requests[id] = cancel
+	r.requests[id] = fetchRequest{cancel: cancel, release: release}
 	return id, nil
 }
 
@@ -45,10 +50,10 @@ func (r *fetchRuntime) cancel(id string) {
 		return
 	}
 	r.mu.Lock()
-	cancel := r.requests[id]
+	request := r.requests[id]
 	r.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	if request.cancel != nil {
+		request.cancel()
 	}
 }
 
@@ -57,8 +62,14 @@ func (r *fetchRuntime) complete(id string) {
 		return
 	}
 	r.mu.Lock()
-	delete(r.requests, id)
+	request, ok := r.requests[id]
+	if ok {
+		delete(r.requests, id)
+	}
 	r.mu.Unlock()
+	if ok && request.release != nil {
+		request.release()
+	}
 }
 
 func (r *fetchRuntime) Close() error {
@@ -66,16 +77,18 @@ func (r *fetchRuntime) Close() error {
 		return nil
 	}
 	r.mu.Lock()
-	requests := make([]context.CancelFunc, 0, len(r.requests))
-	for id, cancel := range r.requests {
+	requests := make([]fetchRequest, 0, len(r.requests))
+	for id, request := range r.requests {
 		delete(r.requests, id)
-		_ = id
-		requests = append(requests, cancel)
+		requests = append(requests, request)
 	}
 	r.mu.Unlock()
-	for _, cancel := range requests {
-		if cancel != nil {
-			cancel()
+	for _, request := range requests {
+		if request.cancel != nil {
+			request.cancel()
+		}
+		if request.release != nil {
+			request.release()
 		}
 	}
 	return nil

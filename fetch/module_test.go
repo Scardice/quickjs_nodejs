@@ -10,6 +10,7 @@ import (
 
 	"github.com/Scardice/quickjs_nodejs/abort"
 	"github.com/Scardice/quickjs_nodejs/eventloop"
+	"github.com/Scardice/quickjs_nodejs/limits"
 	"github.com/Scardice/quickjs_nodejs/url"
 	quickjs "github.com/buke/quickjs-go"
 )
@@ -454,6 +455,134 @@ func TestHeadersUseLiveIteratorsAndResponseGuard(t *testing.T) {
 	}
 	if got, want := result, "fizz:buzz|set-cookie:a=b|set-cookie:a=b|set-cookie:a=b;set-cookie:c=d|0"; got != want {
 		t.Fatalf("Headers result = %q, want %q", got, want)
+	}
+}
+
+func TestFetchRejectsWhenConcurrencyLimitIsExhausted(t *testing.T) {
+	limitsRuntime, err := limits.NewRuntime(limits.Config{MaxFetchConcurrent: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		started <- struct{}{}
+		<-release
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader("ok")),
+			Request:    request,
+		}, nil
+	})
+
+	loop, err := eventloop.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loop.Close()
+	if err := loop.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan string, 1)
+	if !loop.Schedule(func(ctx *quickjs.Context) error {
+		if err := InstallGlobal(ctx, WithTransport(transport), WithResourceLimits(limitsRuntime)); err != nil {
+			return err
+		}
+		report := ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
+			result <- args[0].ToString()
+			return ctx.NewUndefined()
+		})
+		ctx.Globals().Set("reportFetchLimit", report)
+		value := ctx.Eval(`Promise.allSettled([
+			fetch("https://example.test/first"),
+			fetch("https://example.test/second"),
+		]).then(results => reportFetchLimit(results.map(result => result.status).join("|")))`)
+		if value == nil {
+			return errors.New("fetch limit evaluation returned nil")
+		}
+		defer value.Free()
+		if value.IsException() {
+			return ctx.Exception()
+		}
+		return nil
+	}) {
+		t.Fatal("fetch task was rejected")
+	}
+
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("first fetch did not reach transport")
+	}
+	close(release)
+	select {
+	case got := <-result:
+		if want := "fulfilled|rejected"; got != want {
+			t.Fatalf("fetch settlement = %q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fetch limit result timed out")
+	}
+}
+
+func TestFetchRejectsResponsePastConfiguredLimit(t *testing.T) {
+	limitsRuntime, err := limits.NewRuntime(limits.Config{MaxFetchResponseBytes: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: http.StatusOK,
+			Status:     "200 OK",
+			Body:       io.NopCloser(strings.NewReader("too-large")),
+			Request:    request,
+		}, nil
+	})
+
+	loop, err := eventloop.New()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer loop.Close()
+	if err := loop.Start(); err != nil {
+		t.Fatal(err)
+	}
+
+	result := make(chan string, 1)
+	if !loop.Schedule(func(ctx *quickjs.Context) error {
+		if err := InstallGlobal(ctx, WithTransport(transport), WithResourceLimits(limitsRuntime)); err != nil {
+			return err
+		}
+		report := ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
+			result <- args[0].ToString()
+			return ctx.NewUndefined()
+		})
+		ctx.Globals().Set("reportFetchLimit", report)
+		value := ctx.Eval(`fetch("https://example.test/large").then(
+			() => reportFetchLimit("fulfilled"),
+			() => reportFetchLimit("rejected"),
+		)`)
+		if value == nil {
+			return errors.New("fetch body limit evaluation returned nil")
+		}
+		defer value.Free()
+		if value.IsException() {
+			return ctx.Exception()
+		}
+		return nil
+	}) {
+		t.Fatal("fetch task was rejected")
+	}
+
+	select {
+	case got := <-result:
+		if want := "rejected"; got != want {
+			t.Fatalf("fetch settlement = %q, want %q", got, want)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("fetch response limit result timed out")
 	}
 }
 
