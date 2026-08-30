@@ -34,7 +34,7 @@ func TestWebCryptoBasics(t *testing.T) {
 			const signature = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode("message"));
 			const verified = await crypto.subtle.verify("HMAC", key, signature, new TextEncoder().encode("message"));
 			const raw = await crypto.subtle.exportKey("raw", key);
-			const imported = await crypto.subtle.importKey("raw", raw, {name: "HMAC", hash: "SHA-256"}, false, ["sign"]);
+			const imported = await crypto.subtle.importKey("raw", raw, {name: "HMAC", hash: "SHA-256"}, false, ["sign", "verify"]);
 			const aes = await crypto.subtle.generateKey({name: "AES-GCM", length: 128}, true, ["encrypt", "decrypt"]);
 			const iv = crypto.getRandomValues(new Uint8Array(12));
 			const encrypted = await crypto.subtle.encrypt({name: "AES-GCM", iv}, aes, new TextEncoder().encode("hello"));

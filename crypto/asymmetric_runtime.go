@@ -50,16 +50,12 @@ func (s *cryptoState) generateAsymmetricKey(ctx *quickjs.Context, name string, a
 			return cryptoThrow(ctx, err)
 		}
 		if name == "ECDSA" {
-			hashName, err := operationHashName(algorithm, "SHA-256")
-			if err != nil {
-				return cryptoThrow(ctx, err)
-			}
 			private, err := ecdsa.GenerateKey(curve, cryptorand.Reader)
 			if err != nil {
 				return cryptoThrow(ctx, err)
 			}
-			publicKey := &cryptoKey{Type: "public", Algorithm: name, Hash: hashName, NamedCurve: normalized, Extractable: true, Usages: publicUsages, ECDSAPublic: &private.PublicKey}
-			privateKey := &cryptoKey{Type: "private", Algorithm: name, Hash: hashName, NamedCurve: normalized, Extractable: extractable, Usages: privateUsages, ECDSAPrivate: private}
+			publicKey := &cryptoKey{Type: "public", Algorithm: name, NamedCurve: normalized, Extractable: true, Usages: publicUsages, ECDSAPublic: &private.PublicKey}
+			privateKey := &cryptoKey{Type: "private", Algorithm: name, NamedCurve: normalized, Extractable: extractable, Usages: privateUsages, ECDSAPrivate: private}
 			return s.keyPairValue(ctx, publicKey, privateKey)
 		}
 		ecdhCurve, err := ecdhCurveByElliptic(curve)

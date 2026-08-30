@@ -11,8 +11,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strings"
 
+	"github.com/Scardice/quickjs_nodejs/eventloop"
 	"github.com/Scardice/quickjs_nodejs/module"
 	quickjs "github.com/buke/quickjs-go"
 )
@@ -99,20 +101,26 @@ func ensureCrypto(ctx *quickjs.Context) (*quickjs.Value, error) {
 		cached.Free()
 	}
 
-	state := newCryptoState()
+	state, err := newCryptoState(ctx)
+	if err != nil {
+		return nil, err
+	}
 	native := ctx.NewObject()
 	if native == nil {
+		state.Close()
 		return nil, errors.New("crypto: create native object")
 	}
 	installNativeFunctions(ctx, native, state)
 	if !global.DefinePropertyValue(cryptoNativeKey, native, quickjs.PropConfigurable) {
 		native.Free()
+		state.Close()
 		return nil, errors.New("crypto: install native object")
 	}
 	native.Free()
 
 	result := ctx.Eval(cryptoImplementation)
 	if result == nil {
+		state.Close()
 		return nil, errors.New("crypto: initialization returned nil")
 	}
 	if result.IsException() {
@@ -121,6 +129,7 @@ func ensureCrypto(ctx *quickjs.Context) (*quickjs.Value, error) {
 		if err == nil {
 			err = errors.New("crypto: initialization failed")
 		}
+		state.Close()
 		return nil, err
 	}
 	cryptoObject := result.Get("crypto")
@@ -129,13 +138,23 @@ func ensureCrypto(ctx *quickjs.Context) (*quickjs.Value, error) {
 		if cryptoObject != nil {
 			cryptoObject.Free()
 		}
+		state.Close()
 		return nil, errors.New("crypto: initialization returned invalid object")
 	}
+	eventloop.RegisterContextResource(ctx, state)
 	return cryptoObject, nil
 }
 
 const cryptoImplementation = `(function () {
   const native = globalThis["__quickjs_nodejs_crypto_native"];
+  if (typeof globalThis.DOMException !== "function") {
+    globalThis.DOMException = class DOMException extends Error {
+      constructor(message = "", name = "Error") {
+        super(message);
+        this.name = name;
+      }
+    };
+  }
   if (typeof globalThis.TextEncoder !== "function") {
     globalThis.TextEncoder = class TextEncoder {
       encode(input) {
@@ -163,7 +182,7 @@ const cryptoImplementation = `(function () {
   const wrap = value => {
     if (value && typeof value === "object") {
       if (Array.isArray(value)) return value.map(wrap);
-      if (Object.prototype.hasOwnProperty.call(value, "__quickjs_nodejs_crypto_key")) Object.setPrototypeOf(value, CryptoKey.prototype);
+      if (native.isCryptoKey(value)) Object.setPrototypeOf(value, CryptoKey.prototype);
       if (value.publicKey) value.publicKey = wrap(value.publicKey);
       if (value.privateKey) value.privateKey = wrap(value.privateKey);
     }
@@ -185,6 +204,12 @@ const cryptoImplementation = `(function () {
 })()`
 
 func installNativeFunctions(ctx *quickjs.Context, native *quickjs.Value, state *cryptoState) {
+	native.Set("isCryptoKey", ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
+		if len(args) != 1 {
+			return ctx.NewBool(false)
+		}
+		return ctx.NewBool(state.isKey(ctx, args[0]))
+	}))
 	native.Set("getRandomValues", ctx.NewFunction(func(ctx *quickjs.Context, _ *quickjs.Value, args []*quickjs.Value) *quickjs.Value {
 		return state.getRandomValues(ctx, args)
 	}))
@@ -235,8 +260,35 @@ func cryptoThrow(ctx *quickjs.Context, err error) *quickjs.Value {
 	}
 	return ctx.ThrowError(err)
 }
+
+func cryptoDOMException(ctx *quickjs.Context, name, message string) *quickjs.Value {
+	constructor := ctx.Globals().Get("DOMException")
+	if constructor == nil {
+		return cryptoThrow(ctx, errors.New(message))
+	}
+	defer constructor.Free()
+	messageValue := ctx.NewString(message)
+	nameValue := ctx.NewString(name)
+	if messageValue == nil || nameValue == nil {
+		if messageValue != nil {
+			messageValue.Free()
+		}
+		if nameValue != nil {
+			nameValue.Free()
+		}
+		return cryptoThrow(ctx, errors.New(message))
+	}
+	value := constructor.CallConstructor(messageValue, nameValue)
+	messageValue.Free()
+	nameValue.Free()
+	if value == nil || value.IsException() {
+		return value
+	}
+	return ctx.Throw(value)
+}
+
 func cryptoOperationError(ctx *quickjs.Context, message string) *quickjs.Value {
-	return cryptoThrow(ctx, errors.New(message))
+	return cryptoDOMException(ctx, "OperationError", message)
 }
 
 func (s *cryptoState) getRandomValues(ctx *quickjs.Context, args []*quickjs.Value) *quickjs.Value {
@@ -256,11 +308,11 @@ func (s *cryptoState) getRandomValues(ctx *quickjs.Context, args []*quickjs.Valu
 	}
 	data := make([]byte, length)
 	if _, err := cryptorand.Read(data); err != nil {
-		return cryptoThrow(ctx, err)
+		return cryptoOperationError(ctx, err.Error())
 	}
-	array := ctx.NewUint8Array(data)
+	array := randomTypedArray(ctx, target, data)
 	if array == nil {
-		return ctx.ThrowInternalError("create random byte array")
+		return ctx.ThrowInternalError("create random typed array")
 	}
 	result := target.Call("set", array)
 	array.Free()
@@ -272,6 +324,65 @@ func (s *cryptoState) getRandomValues(ctx *quickjs.Context, args []*quickjs.Valu
 	}
 	result.Free()
 	return ctx.NewUndefined()
+}
+
+func randomTypedArray(ctx *quickjs.Context, target *quickjs.Value, data []byte) *quickjs.Value {
+	if target.IsInt8Array() {
+		values := make([]int8, len(data))
+		for index, value := range data {
+			values[index] = int8(value)
+		}
+		return ctx.NewInt8Array(values)
+	}
+	if target.IsUint8Array() {
+		return ctx.NewUint8Array(data)
+	}
+	if target.IsUint8ClampedArray() {
+		return ctx.NewUint8ClampedArray(data)
+	}
+	if target.IsInt16Array() {
+		values := make([]int16, len(data)/2)
+		for index := range values {
+			values[index] = int16(binary.LittleEndian.Uint16(data[index*2:]))
+		}
+		return ctx.NewInt16Array(values)
+	}
+	if target.IsUint16Array() {
+		values := make([]uint16, len(data)/2)
+		for index := range values {
+			values[index] = binary.LittleEndian.Uint16(data[index*2:])
+		}
+		return ctx.NewUint16Array(values)
+	}
+	if target.IsInt32Array() {
+		values := make([]int32, len(data)/4)
+		for index := range values {
+			values[index] = int32(binary.LittleEndian.Uint32(data[index*4:]))
+		}
+		return ctx.NewInt32Array(values)
+	}
+	if target.IsUint32Array() {
+		values := make([]uint32, len(data)/4)
+		for index := range values {
+			values[index] = binary.LittleEndian.Uint32(data[index*4:])
+		}
+		return ctx.NewUint32Array(values)
+	}
+	if target.IsBigInt64Array() {
+		values := make([]int64, len(data)/8)
+		for index := range values {
+			values[index] = int64(binary.LittleEndian.Uint64(data[index*8:]))
+		}
+		return ctx.NewBigInt64Array(values)
+	}
+	if target.IsBigUint64Array() {
+		values := make([]uint64, len(data)/8)
+		for index := range values {
+			values[index] = binary.LittleEndian.Uint64(data[index*8:])
+		}
+		return ctx.NewBigUint64Array(values)
+	}
+	return nil
 }
 
 func (s *cryptoState) randomUUID(ctx *quickjs.Context) *quickjs.Value {
@@ -319,6 +430,9 @@ func (s *cryptoState) generateKey(ctx *quickjs.Context, args []*quickjs.Value) *
 	extractable := args[1].ToBool()
 	usages, err := usageList(args[2])
 	if err != nil {
+		return cryptoThrow(ctx, err)
+	}
+	if err := validateKeyUsages(name, "", usages); err != nil {
 		return cryptoThrow(ctx, err)
 	}
 	if name == "RSASSA-PKCS1-V1_5" || name == "RSA-PSS" || name == "RSA-OAEP" || name == "RSAES-PKCS1-V1_5" || name == "ECDSA" || name == "ECDH" || name == "ED25519" || name == "X25519" {
@@ -369,8 +483,14 @@ func (s *cryptoState) importKey(ctx *quickjs.Context, args []*quickjs.Value) *qu
 	}
 	extractable := args[3].ToBool()
 	usages, err := usageList(args[4])
+	if err != nil {
+		return cryptoThrow(ctx, err)
+	}
 	key, err := importKeyMaterial(ctx, format, args[1], name, algorithm, extractable, usages)
 	if err != nil {
+		return cryptoThrow(ctx, err)
+	}
+	if err := validateKeyUsages(name, key.Type, usages); err != nil {
 		return cryptoThrow(ctx, err)
 	}
 	return s.addKey(ctx, key)
@@ -436,10 +556,7 @@ func (s *cryptoState) sign(ctx *quickjs.Context, args []*quickjs.Value) *quickjs
 		if key.Algorithm != "HMAC" {
 			return cryptoThrow(ctx, errors.New("HMAC key is required"))
 		}
-		hashName, err := operationHashName(algorithm, key.Hash)
-		if err != nil {
-			return cryptoThrow(ctx, err)
-		}
+		hashName := key.Hash
 		signature, err := hmacBytes(hashName, key.Secret, data)
 		if err != nil {
 			return cryptoThrow(ctx, err)
@@ -449,10 +566,7 @@ func (s *cryptoState) sign(ctx *quickjs.Context, args []*quickjs.Value) *quickjs
 		if key.Algorithm != name || key.RSAPrivate == nil {
 			return cryptoThrow(ctx, errors.New("RSA private key is required"))
 		}
-		hashName, err := operationHashName(algorithm, key.Hash)
-		if err != nil {
-			return cryptoThrow(ctx, err)
-		}
+		hashName := key.Hash
 		saltLength := -1
 		if name == "RSA-PSS" {
 			saltLength = intProperty(algorithm, "saltLength", -1)
@@ -466,9 +580,9 @@ func (s *cryptoState) sign(ctx *quickjs.Context, args []*quickjs.Value) *quickjs
 		if key.Algorithm != name || key.ECDSAPrivate == nil {
 			return cryptoThrow(ctx, errors.New("ECDSA private key is required"))
 		}
-		hashName, err := operationHashName(algorithm, key.Hash)
-		if err != nil {
-			return cryptoThrow(ctx, err)
+		hashName, failure := requiredOperationHash(ctx, algorithm)
+		if failure != nil {
+			return failure
 		}
 		signature, err := ecdsaSignBytes(hashName, key.ECDSAPrivate, data)
 		if err != nil {
@@ -501,7 +615,7 @@ func (s *cryptoState) verify(ctx *quickjs.Context, args []*quickjs.Value) *quick
 	if err != nil {
 		return cryptoThrow(ctx, err)
 	}
-	if !hasUsage(key, "verify") && !hasUsage(key, "sign") {
+	if !hasUsage(key, "verify") {
 		return cryptoThrow(ctx, errors.New("key is not permitted for verify"))
 	}
 	signature, err := readBufferSource(ctx, args[2])
@@ -517,10 +631,7 @@ func (s *cryptoState) verify(ctx *quickjs.Context, args []*quickjs.Value) *quick
 		if key.Algorithm != "HMAC" {
 			return cryptoThrow(ctx, errors.New("HMAC key is required"))
 		}
-		hashName, err := operationHashName(algorithm, key.Hash)
-		if err != nil {
-			return cryptoThrow(ctx, err)
-		}
+		hashName := key.Hash
 		expected, err := hmacBytes(hashName, key.Secret, data)
 		if err != nil {
 			return cryptoThrow(ctx, err)
@@ -530,10 +641,7 @@ func (s *cryptoState) verify(ctx *quickjs.Context, args []*quickjs.Value) *quick
 		if key.Algorithm != name || key.RSAPublic == nil {
 			return cryptoThrow(ctx, errors.New("RSA public key is required"))
 		}
-		hashName, err := operationHashName(algorithm, key.Hash)
-		if err != nil {
-			return cryptoThrow(ctx, err)
-		}
+		hashName := key.Hash
 		saltLength := -1
 		if name == "RSA-PSS" {
 			saltLength = intProperty(algorithm, "saltLength", -1)
@@ -550,9 +658,9 @@ func (s *cryptoState) verify(ctx *quickjs.Context, args []*quickjs.Value) *quick
 		if key.Algorithm != name || key.ECDSAPublic == nil {
 			return cryptoThrow(ctx, errors.New("ECDSA public key is required"))
 		}
-		hashName, err := operationHashName(algorithm, key.Hash)
-		if err != nil {
-			return cryptoThrow(ctx, err)
+		hashName, failure := requiredOperationHash(ctx, algorithm)
+		if failure != nil {
+			return failure
 		}
 		valid, err := ecdsaVerifyBytes(hashName, key.ECDSAPublic, signature, data)
 		if err != nil {
@@ -619,12 +727,6 @@ func (s *cryptoState) crypt(ctx *quickjs.Context, args []*quickjs.Value, encrypt
 			return cryptoThrow(ctx, errors.New("RSA private key is required for decryption"))
 		}
 		hashName := key.Hash
-		if name == "RSA-OAEP" {
-			hashName, err = operationHashName(algorithm, key.Hash)
-			if err != nil {
-				return cryptoThrow(ctx, err)
-			}
-		}
 		labelValue := algorithmProperty(algorithm, "label")
 		label, labelErr := readOptionalBufferSource(ctx, labelValue)
 		if labelValue != nil {
@@ -645,7 +747,7 @@ func (s *cryptoState) crypt(ctx *quickjs.Context, args []*quickjs.Value, encrypt
 	}
 	result, err = cryptBytes(name, algorithm, key.Secret, data, encrypt)
 	if err != nil {
-		return cryptoThrow(ctx, err)
+		return cryptoOperationError(ctx, err.Error())
 	}
 	return ctx.NewArrayBuffer(result)
 }
@@ -662,8 +764,8 @@ func (s *cryptoState) deriveBits(ctx *quickjs.Context, args []*quickjs.Value) *q
 	if err != nil {
 		return cryptoThrow(ctx, err)
 	}
-	if !hasUsage(key, "deriveBits") && !hasUsage(key, "deriveKey") {
-		return cryptoThrow(ctx, errors.New("key is not permitted for derivation"))
+	if !hasUsage(key, "deriveBits") {
+		return cryptoThrow(ctx, errors.New("key is not permitted for deriveBits"))
 	}
 	lengthBits := args[2].ToInt64()
 	if lengthBits < 0 || lengthBits%8 != 0 {
@@ -693,8 +795,8 @@ func (s *cryptoState) deriveKey(ctx *quickjs.Context, args []*quickjs.Value) *qu
 	if err != nil {
 		return cryptoThrow(ctx, err)
 	}
-	if !hasUsage(base, "deriveKey") && !hasUsage(base, "deriveBits") {
-		return cryptoThrow(ctx, errors.New("key is not permitted for derivation"))
+	if !hasUsage(base, "deriveKey") {
+		return cryptoThrow(ctx, errors.New("key is not permitted for deriveKey"))
 	}
 	derivedName, derivedObject, err := algorithmName(args[2])
 	if err != nil {
@@ -715,6 +817,9 @@ func (s *cryptoState) deriveKey(ctx *quickjs.Context, args []*quickjs.Value) *qu
 	}
 	usages, err := usageList(args[4])
 	if err != nil {
+		return cryptoThrow(ctx, err)
+	}
+	if err := validateKeyUsages(derivedName, keyTypeForAlgorithm(derivedName), usages); err != nil {
 		return cryptoThrow(ctx, err)
 	}
 	key := &cryptoKey{Type: keyTypeForAlgorithm(derivedName), Algorithm: derivedName, Length: length, Extractable: args[3].ToBool(), Usages: usages, Secret: material}
@@ -808,6 +913,25 @@ func operationHashName(algorithm *quickjs.Value, fallback string) (string, error
 	return algorithmHash(hashValue, fallback)
 }
 
+func requiredOperationHash(ctx *quickjs.Context, algorithm *quickjs.Value) (string, *quickjs.Value) {
+	hashValue := algorithmProperty(algorithm, "hash")
+	if hashValue == nil {
+		return "", ctx.ThrowTypeError("algorithm.hash is required")
+	}
+	defer hashValue.Free()
+	if hashValue.IsUndefined() || hashValue.IsNull() {
+		return "", ctx.ThrowTypeError("algorithm.hash is required")
+	}
+	hashName, err := algorithmHash(hashValue, "")
+	if err != nil || hashName == "" {
+		if err == nil {
+			err = errors.New("algorithm.hash.name is required")
+		}
+		return "", ctx.ThrowTypeError(err.Error())
+	}
+	return hashName, nil
+}
+
 func intProperty(value *quickjs.Value, name string, fallback int64) int {
 	if value == nil {
 		return int(fallback)
@@ -821,6 +945,22 @@ func intProperty(value *quickjs.Value, name string, fallback int64) int {
 		return int(fallback)
 	}
 	return int(property.ToInt64())
+}
+
+func requiredIntegerProperty(value *quickjs.Value, name string, minimum, maximum int) (int, error) {
+	property := algorithmProperty(value, name)
+	if property == nil {
+		return 0, fmt.Errorf("%s is required", name)
+	}
+	defer property.Free()
+	if property.IsException() || !property.IsNumber() {
+		return 0, fmt.Errorf("%s must be an integer", name)
+	}
+	number := property.ToFloat64()
+	if math.IsNaN(number) || math.IsInf(number, 0) || number != math.Trunc(number) || number < float64(minimum) || number > float64(maximum) {
+		return 0, fmt.Errorf("%s must be between %d and %d", name, minimum, maximum)
+	}
+	return int(number), nil
 }
 
 func deriveMaterial(name string, algorithm *quickjs.Value, secret []byte, length int) ([]byte, error) {
@@ -965,12 +1105,11 @@ func cryptBytes(name string, algorithm *quickjs.Value, key, data []byte, encrypt
 		if err != nil {
 			return nil, err
 		}
-		if len(counter) != aes.BlockSize {
-			return nil, errors.New("AES-CTR counter must be 16 bytes")
+		counterBits, err := requiredIntegerProperty(algorithm, "length", 1, aes.BlockSize*8)
+		if err != nil {
+			return nil, fmt.Errorf("AES-CTR %w", err)
 		}
-		out := make([]byte, len(data))
-		cipher.NewCTR(block, counter).XORKeyStream(out, data)
-		return out, nil
+		return aesCTRBytes(block, counter, counterBits, data)
 	default:
 		return nil, fmt.Errorf("unsupported encryption algorithm: %s", name)
 	}

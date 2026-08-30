@@ -9,14 +9,9 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync/atomic"
 
 	quickjs "github.com/buke/quickjs-go"
 )
-
-const keyHandleSlot = "__quickjs_nodejs_crypto_key"
-
-var nextStateID uint64
 
 type cryptoKey struct {
 	Type        string
@@ -41,24 +36,47 @@ type cryptoKey struct {
 }
 
 type cryptoState struct {
-	id   string
-	keys map[string]*cryptoKey
-	next uint64
+	keys     map[string]*cryptoKey
+	keyStore *quickjs.Value
+	next     uint64
 }
 
-func newCryptoState() *cryptoState {
-	return &cryptoState{
-		id:   strconv.FormatUint(atomic.AddUint64(&nextStateID, 1), 10),
-		keys: make(map[string]*cryptoKey),
+func newCryptoState(ctx *quickjs.Context) (*cryptoState, error) {
+	if ctx == nil {
+		return nil, errors.New("crypto: nil context")
 	}
+	keyStore := ctx.Eval("new WeakMap()")
+	if keyStore == nil || keyStore.IsException() {
+		if keyStore != nil {
+			keyStore.Free()
+		}
+		return nil, errors.New("crypto: create key store")
+	}
+	return &cryptoState{
+		keys:     make(map[string]*cryptoKey),
+		keyStore: keyStore,
+	}, nil
+}
+
+func (s *cryptoState) Close() error {
+	if s == nil {
+		return nil
+	}
+	if s.keyStore != nil {
+		s.keyStore.Free()
+		s.keyStore = nil
+	}
+	clear(s.keys)
+	return nil
 }
 
 func (s *cryptoState) addKey(ctx *quickjs.Context, key *cryptoKey) *quickjs.Value {
-	if s == nil || key == nil || ctx == nil {
+
+	if s == nil || key == nil || ctx == nil || s.keyStore == nil {
 		return nil
 	}
 	s.next++
-	id := s.id + ":" + strconv.FormatUint(s.next, 10)
+	id := strconv.FormatUint(s.next, 10)
 	s.keys[id] = key
 
 	object := ctx.NewObject()
@@ -66,27 +84,85 @@ func (s *cryptoState) addKey(ctx *quickjs.Context, key *cryptoKey) *quickjs.Valu
 		delete(s.keys, id)
 		return nil
 	}
-	object.Set("type", ctx.NewString(key.Type))
-	object.Set("extractable", ctx.NewBool(key.Extractable))
-	algorithm := keyAlgorithmValue(ctx, key)
-	if algorithm == nil {
+	if !defineReadOnlyProperty(object, "type", ctx.NewString(key.Type)) ||
+		!defineReadOnlyProperty(object, "extractable", ctx.NewBool(key.Extractable)) {
 		object.Free()
 		delete(s.keys, id)
 		return nil
 	}
-	object.Set("algorithm", algorithm)
-	object.Set("usages", stringArray(ctx, key.Usages))
-	handle := ctx.NewString(id)
-	if handle == nil || !object.DefinePropertyValue(keyHandleSlot, handle, quickjs.PropConfigurable) {
-		if handle != nil {
-			handle.Free()
+	algorithm := keyAlgorithmValue(ctx, key)
+	if algorithm == nil || !defineReadOnlyProperty(object, "algorithm", algorithm) {
+		object.Free()
+		delete(s.keys, id)
+		return nil
+	}
+	usages := stringArray(ctx, key.Usages)
+	if usages == nil || !freezeValue(ctx, usages) {
+		if usages != nil {
+			usages.Free()
 		}
 		object.Free()
 		delete(s.keys, id)
 		return nil
 	}
+	if !defineReadOnlyProperty(object, "usages", usages) {
+		object.Free()
+		delete(s.keys, id)
+		return nil
+	}
+
+	handle := ctx.NewString(id)
+	if handle == nil {
+		object.Free()
+		delete(s.keys, id)
+		return nil
+	}
+	stored := s.keyStore.Call("set", object, handle)
 	handle.Free()
+	if stored == nil || stored.IsException() {
+		if stored != nil {
+			stored.Free()
+		}
+		object.Free()
+		delete(s.keys, id)
+		return nil
+	}
+	stored.Free()
 	return object
+}
+
+func defineReadOnlyProperty(object *quickjs.Value, name string, value *quickjs.Value) bool {
+	if value == nil {
+		return false
+	}
+	defer value.Free()
+	return object.DefineProperty(name, quickjs.PropertyDescriptor{
+		Value: value,
+		Flags: quickjs.PropHasValue |
+			quickjs.PropHasWritable |
+			quickjs.PropHasConfigurable |
+			quickjs.PropHasEnumerable |
+			quickjs.PropEnumerable,
+	})
+}
+
+func freezeValue(ctx *quickjs.Context, value *quickjs.Value) bool {
+	object := ctx.Globals().Get("Object")
+	if object == nil {
+		return false
+	}
+	defer object.Free()
+	freeze := object.Get("freeze")
+	if freeze == nil {
+		return false
+	}
+	defer freeze.Free()
+	result := freeze.Execute(object, value)
+	if result == nil {
+		return false
+	}
+	defer result.Free()
+	return !result.IsException()
 }
 
 func keyAlgorithmValue(ctx *quickjs.Context, key *cryptoKey) *quickjs.Value {
@@ -102,7 +178,7 @@ func keyAlgorithmValue(ctx *quickjs.Context, key *cryptoKey) *quickjs.Value {
 	if key.Length > 0 {
 		algorithm.Set("length", ctx.NewInt32(int32(key.Length)))
 	}
-	if key.Hash != "" {
+	if key.Hash != "" && key.Algorithm != "ECDSA" {
 		hash := ctx.NewObject()
 		hash.Set("name", ctx.NewString(key.Hash))
 		algorithm.Set("hash", hash)
@@ -126,26 +202,34 @@ func stringArray(ctx *quickjs.Context, values []string) *quickjs.Value {
 }
 
 func (s *cryptoState) keyFromValue(ctx *quickjs.Context, value *quickjs.Value) (*cryptoKey, error) {
-	if s == nil || ctx == nil || value == nil || !value.IsObject() {
-		return nil, errors.New("expected a CryptoKey")
+	if !s.isKey(ctx, value) {
+		return nil, errors.New("invalid CryptoKey")
 	}
-	if value.Context() != ctx {
-		return nil, errors.New("CryptoKey belongs to a different context")
-	}
-	handle := value.Get(keyHandleSlot)
+	handle := s.keyStore.Call("get", value)
 	if handle == nil {
 		return nil, errors.New("invalid CryptoKey")
 	}
 	defer handle.Free()
-	if handle.IsUndefined() || handle.IsNull() {
+	if handle.IsException() || handle.IsUndefined() || handle.IsNull() || !handle.IsString() {
 		return nil, errors.New("invalid CryptoKey")
 	}
-	id := handle.ToString()
-	key := s.keys[id]
+	key := s.keys[handle.ToString()]
 	if key == nil {
 		return nil, errors.New("invalid or expired CryptoKey")
 	}
 	return key, nil
+}
+
+func (s *cryptoState) isKey(ctx *quickjs.Context, value *quickjs.Value) bool {
+	if s == nil || ctx == nil || value == nil || !value.IsObject() || value.Context() != ctx || s.keyStore == nil {
+		return false
+	}
+	registered := s.keyStore.Call("has", value)
+	if registered == nil {
+		return false
+	}
+	defer registered.Free()
+	return !registered.IsException() && registered.ToBool()
 }
 
 func algorithmName(value *quickjs.Value) (string, *quickjs.Value, error) {
@@ -189,15 +273,67 @@ func usageList(value *quickjs.Value) ([]string, error) {
 	}
 	usages := make([]string, 0, len(items))
 	for _, item := range items {
-		if item == nil {
-			continue
+		if item == nil || !item.IsString() {
+			for _, value := range items {
+				if value != nil {
+					value.Free()
+				}
+			}
+			return nil, errors.New("key usage must be a string")
 		}
-		if item.IsString() {
-			usages = append(usages, item.ToString())
-		}
+		usages = append(usages, item.ToString())
+	}
+	for _, item := range items {
 		item.Free()
 	}
 	return usages, nil
+}
+
+func validateKeyUsages(algorithm, keyType string, usages []string) error {
+	seen := make(map[string]struct{}, len(usages))
+	for _, usage := range usages {
+		if _, duplicate := seen[usage]; duplicate {
+			return fmt.Errorf("duplicate key usage: %s", usage)
+		}
+		seen[usage] = struct{}{}
+		if !keyUsageAllowed(algorithm, keyType, usage) {
+			return fmt.Errorf("%s is not a valid usage for %s %s key", usage, keyType, algorithm)
+		}
+	}
+	return nil
+}
+
+func keyUsageAllowed(algorithm, keyType, usage string) bool {
+	switch normalizeName(algorithm) {
+	case "AES-CBC", "AES-CTR", "AES-GCM":
+		return usage == "encrypt" || usage == "decrypt" || usage == "wrapKey" || usage == "unwrapKey"
+	case "AES-KW":
+		return usage == "wrapKey" || usage == "unwrapKey"
+	case "HMAC":
+		return usage == "sign" || usage == "verify"
+	case "PBKDF2", "HKDF":
+		return usage == "deriveKey" || usage == "deriveBits"
+	case "RSASSA-PKCS1-V1_5", "RSA-PSS", "ECDSA", "ED25519":
+		if keyType == "public" {
+			return usage == "verify"
+		}
+		if keyType == "private" {
+			return usage == "sign"
+		}
+		return usage == "sign" || usage == "verify"
+	case "RSA-OAEP", "RSAES-PKCS1-V1_5":
+		if keyType == "public" {
+			return usage == "encrypt" || usage == "wrapKey"
+		}
+		if keyType == "private" {
+			return usage == "decrypt" || usage == "unwrapKey"
+		}
+		return usage == "encrypt" || usage == "decrypt" || usage == "wrapKey" || usage == "unwrapKey"
+	case "ECDH", "X25519":
+		return keyType != "public" && (usage == "deriveKey" || usage == "deriveBits")
+	default:
+		return false
+	}
 }
 
 func hasUsage(key *cryptoKey, usage string) bool {
