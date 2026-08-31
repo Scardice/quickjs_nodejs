@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/Scardice/quickjs_nodejs/eventloop"
+	"github.com/Scardice/quickjs_nodejs/limits"
 	quickjs "github.com/buke/quickjs-go"
 )
 
@@ -63,7 +64,30 @@ func TestWebCryptoRejectsDeriveBitsWithoutUsage(t *testing.T) {
 	}
 }
 
+func TestWebCryptoRejectsPBKDF2PastConfiguredLimit(t *testing.T) {
+	resourceLimits, err := limits.NewRuntime(limits.Config{MaxPBKDF2Iterations: 1, MaxPBKDF2OutputBytes: 8})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := runWebCryptoWithOptions(t, []Option{WithResourceLimits(resourceLimits)}, `(async () => {
+		const key = await crypto.subtle.importKey("raw", new Uint8Array([112, 97, 115, 115]), "PBKDF2", false, ["deriveBits"]);
+		try {
+			await crypto.subtle.deriveBits({name: "PBKDF2", salt: new Uint8Array([115, 97, 108, 116]), iterations: 2, hash: "SHA-256"}, key, 128);
+			return "accepted";
+		} catch (_) {
+			return "rejected";
+		}
+	})()`)
+	if result != "rejected" {
+		t.Fatalf("over-limit PBKDF2 result = %q, want rejected", result)
+	}
+}
+
 func runWebCrypto(t *testing.T, source string) string {
+	return runWebCryptoWithOptions(t, nil, source)
+}
+
+func runWebCryptoWithOptions(t *testing.T, options []Option, source string) string {
 	t.Helper()
 
 	loop, err := eventloop.New()
@@ -74,7 +98,7 @@ func runWebCrypto(t *testing.T, source string) string {
 
 	var result string
 	if err := loop.Run(func(ctx *quickjs.Context) error {
-		if err := InstallGlobal(ctx); err != nil {
+		if err := InstallGlobal(ctx, options...); err != nil {
 			return err
 		}
 		value := ctx.Eval(source, quickjs.EvalAwait(true))

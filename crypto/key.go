@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/Scardice/quickjs_nodejs/limits"
 	quickjs "github.com/buke/quickjs-go"
 )
 
@@ -36,12 +37,13 @@ type cryptoKey struct {
 }
 
 type cryptoState struct {
-	keys     map[string]*cryptoKey
-	keyStore *quickjs.Value
-	next     uint64
+	keys           map[string]*cryptoKey
+	keyStore       *quickjs.Value
+	next           uint64
+	resourceLimits *limits.Runtime
 }
 
-func newCryptoState(ctx *quickjs.Context) (*cryptoState, error) {
+func newCryptoState(ctx *quickjs.Context, resourceLimits *limits.Runtime) (*cryptoState, error) {
 	if ctx == nil {
 		return nil, errors.New("crypto: nil context")
 	}
@@ -53,8 +55,9 @@ func newCryptoState(ctx *quickjs.Context) (*cryptoState, error) {
 		return nil, errors.New("crypto: create key store")
 	}
 	return &cryptoState{
-		keys:     make(map[string]*cryptoKey),
-		keyStore: keyStore,
+		keys:           make(map[string]*cryptoKey),
+		keyStore:       keyStore,
+		resourceLimits: resourceLimits,
 	}, nil
 }
 

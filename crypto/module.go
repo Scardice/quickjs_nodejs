@@ -15,6 +15,7 @@ import (
 	"strings"
 
 	"github.com/Scardice/quickjs_nodejs/eventloop"
+	"github.com/Scardice/quickjs_nodejs/limits"
 	"github.com/Scardice/quickjs_nodejs/module"
 	quickjs "github.com/buke/quickjs-go"
 )
@@ -25,6 +26,26 @@ const (
 	cryptoExportsKey        = "__quickjs_nodejs_crypto_exports"
 	cryptoNativeKey         = "__quickjs_nodejs_crypto_native"
 )
+
+type Option func(*Config)
+
+type Config struct {
+	ResourceLimits *limits.Runtime
+}
+
+func WithResourceLimits(resourceLimits *limits.Runtime) Option {
+	return func(config *Config) { config.ResourceLimits = resourceLimits }
+}
+
+func applyOptions(options []Option) Config {
+	config := Config{}
+	for _, option := range options {
+		if option != nil {
+			option(&config)
+		}
+	}
+	return config
+}
 
 // Module returns the crypto and node:crypto WebCrypto module definition.
 func Module() module.Definition {
@@ -55,11 +76,11 @@ func Module() module.Definition {
 }
 
 // InstallGlobal installs a fresh WebCrypto-compatible crypto object in ctx.
-func InstallGlobal(ctx *quickjs.Context) error {
+func InstallGlobal(ctx *quickjs.Context, options ...Option) error {
 	if ctx == nil {
 		return errors.New("crypto: nil context")
 	}
-	cryptoObject, err := ensureCrypto(ctx)
+	cryptoObject, err := ensureCrypto(ctx, applyOptions(options))
 	if err != nil {
 		return err
 	}
@@ -68,7 +89,7 @@ func InstallGlobal(ctx *quickjs.Context) error {
 }
 
 func cryptoExport(ctx *quickjs.Context, name string) (*quickjs.Value, error) {
-	cryptoObject, err := ensureCrypto(ctx)
+	cryptoObject, err := ensureCrypto(ctx, Config{})
 	if err != nil {
 		return nil, err
 	}
@@ -85,7 +106,7 @@ func cryptoExport(ctx *quickjs.Context, name string) (*quickjs.Value, error) {
 	return value, nil
 }
 
-func ensureCrypto(ctx *quickjs.Context) (*quickjs.Value, error) {
+func ensureCrypto(ctx *quickjs.Context, config Config) (*quickjs.Value, error) {
 	global := ctx.Globals()
 	cached := global.Get(cryptoExportsKey)
 	if cached != nil && cached.IsObject() {
@@ -101,7 +122,7 @@ func ensureCrypto(ctx *quickjs.Context) (*quickjs.Value, error) {
 		cached.Free()
 	}
 
-	state, err := newCryptoState(ctx)
+	state, err := newCryptoState(ctx, config.ResourceLimits)
 	if err != nil {
 		return nil, err
 	}
@@ -817,6 +838,14 @@ func (s *cryptoState) deriveBits(ctx *quickjs.Context, args []*quickjs.Value) *q
 	lengthBits := args[2].ToInt64()
 	if lengthBits < 0 || lengthBits%8 != 0 {
 		return cryptoOperationError(ctx, "deriveBits length must be a non-negative multiple of 8")
+	}
+	if algorithm == "PBKDF2" {
+		if maxBytes := s.resourceLimits.Config().MaxPBKDF2OutputBytes; maxBytes > 0 && lengthBits/8 > int64(maxBytes) {
+			return cryptoOperationError(ctx, "PBKDF2 output exceeds configured byte limit")
+		}
+		if maxIterations := s.resourceLimits.Config().MaxPBKDF2Iterations; maxIterations > 0 && intProperty(algorithmObject, "iterations", 0) > maxIterations {
+			return cryptoOperationError(ctx, "PBKDF2 iterations exceed configured limit")
+		}
 	}
 	var result []byte
 	if algorithm == "ECDH" || algorithm == "X25519" {
